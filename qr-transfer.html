@@ -12453,6 +12453,12 @@ video { max-width: 320px; background: #000; }
         <option value="600" selected>600</option>
         <option value="1000">1000</option>
       </select> B</label>
+      <label>尺寸 <select id="opt-size">
+        <option value="auto" selected>自适应</option>
+        <option value="400">400px</option>
+        <option value="600">600px</option>
+        <option value="800">800px</option>
+      </select></label>
       <button id="btn-send-start" disabled>开始</button>
       <button id="btn-send-pause" disabled>暂停</button>
     </div>
@@ -12673,6 +12679,18 @@ function buildQrModel(frame) {
   qr.make();
   return qr;
 }
+// 统一版本：以最大帧确定版本，保证一次传输所有帧的 QR 尺寸一致（抓屏解码更稳定）
+function buildQrModels(frames) {
+  let maxFrame = frames[0];
+  for (const f of frames) if (f.length > maxFrame.length) maxFrame = f;
+  const version = (buildQrModel(maxFrame).getModuleCount() - 17) / 4;
+  return frames.map(f => {
+    const qr = qrcode(version, 'M');
+    qr.addData(bytesToLatin1(f), 'Byte');
+    qr.make();
+    return qr;
+  });
+}
 function drawQrModel(qr, canvas, maxPx) {
   const count = qr.getModuleCount();
   const quiet = 4;
@@ -12721,7 +12739,8 @@ const sender = {
     }
     // 窗口期内可能已被点击启动定时器，再次 pause 清除（成功路径末尾会重新启用按钮）
     this.pause();
-    this.qrModels = null; this.idx = 0; this.loops = 0;
+    this.qrModels = buildQrModels(this.transfer.frames);
+    this.idx = 0; this.loops = 0;
     const m = this.transfer.meta;
     setSendStatus(
       '文件：' + m.name + '（' + m.size + ' B' +
@@ -12732,11 +12751,11 @@ const sender = {
     );
     document.getElementById('btn-send-start').disabled = false;
     // 未开始播放时先静态显示首帧，便于确认窗口
-    renderFrameToCanvas(this.transfer.frames[0], document.getElementById('qr-canvas'), qrMaxPx());
+    drawQrModel(this.qrModels[0], document.getElementById('qr-canvas'), qrMaxPx());
   },
   start() {
     if (!this.transfer || this.timer) return;
-    if (!this.qrModels) this.qrModels = this.transfer.frames.map(buildQrModel);
+    if (!this.qrModels) this.qrModels = buildQrModels(this.transfer.frames);
     const fps = +document.getElementById('opt-fps').value;
     const n = this.transfer.frames.length;
     const canvas = document.getElementById('qr-canvas');
@@ -12756,6 +12775,8 @@ const sender = {
   },
 };
 function qrMaxPx() {
+  const v = document.getElementById('opt-size').value;
+  if (v !== 'auto') return +v;
   return Math.max(200, Math.min(window.innerWidth, window.innerHeight) - 80);
 }
 function setSendStatus(s) { document.getElementById('send-status').textContent = s; }
@@ -12782,6 +12803,12 @@ function initSender() {
   document.getElementById('opt-fps').addEventListener('input', e => {
     document.getElementById('opt-fps-val').textContent = e.target.value;
     if (sender.timer) { sender.pause(); sender.start(); }   // 播放中调速即时生效
+  });
+  document.getElementById('opt-size').addEventListener('change', () => {
+    // 暂停中换尺寸：立即重绘当前帧；播放中下一帧自动生效
+    if (!sender.timer && sender.qrModels) {
+      drawQrModel(sender.qrModels[sender.idx], document.getElementById('qr-canvas'), qrMaxPx());
+    }
   });
 }
 initSender();
@@ -12868,16 +12895,14 @@ const receiver = {
       }
       case 'progress': {
         document.getElementById('recv-progress').value = r.received / r.total;
-        const cells = document.getElementById('chunk-grid').children;
-        for (let i = 0; i < asm.chunks.length; i++) {
-          if (asm.chunks[i] !== null) cells[i].classList.add('got');
-        }
+        markChunkGrid(asm);
         setRecvStatus('接收中：' + r.received + '/' + r.total + ' 片｜坏帧 ' + asm.badFrames);
         break;
       }
       case 'complete': {
         if (this.done) break;         // 循环播放会反复 complete，只处理一次
         this.done = true;
+        markChunkGrid(asm);           // 最后一片随 complete 到达，也要标绿
         document.getElementById('recv-progress').value = 1;
         const m = r.meta;
         setRecvStatus('完成：' + m.name + '（' + m.size + ' B）✔ SHA-256 校验通过');
@@ -12896,6 +12921,13 @@ const receiver = {
   },
 };
 function setRecvStatus(s) { document.getElementById('recv-status').textContent = s; }
+function markChunkGrid(asm) {
+  if (!asm.chunks) return;          // A 帧路径无分片位图
+  const cells = document.getElementById('chunk-grid').children;
+  for (let i = 0; i < asm.chunks.length && i < cells.length; i++) {
+    if (asm.chunks[i] !== null) cells[i].classList.add('got');
+  }
+}
 function downloadBlob(name, data) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([data]));
@@ -12919,6 +12951,48 @@ function route() {
 window.addEventListener('hashchange', route);
 /* ===== 测试用例 ===== */
 // __TESTS__
+test('同一次传输所有帧 QR 版本统一（尺寸一致）', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(1200));
+  const t = await prepareTransfer('size.bin', data, 600);
+  assert(t.frames.length > 2, '应含头帧 + 多片数据帧');
+  const models = buildQrModels(t.frames);
+  const counts = models.map(m => m.getModuleCount());
+  for (const c of counts) assertEq(c, counts[0], '所有帧模块数应一致');
+  for (let i = 0; i < models.length; i++) {
+    const canvas = document.createElement('canvas');
+    drawQrModel(models[i], canvas, 600);
+    assertBytesEq(decodeQRFromCanvas(canvas), t.frames[i], '帧 ' + i);
+  }
+});
+test('接收完成时所有分片格（含最后一格）变绿', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(800));
+  const t = await prepareTransfer('grid.bin', data, 600);
+  const origDownload = downloadBlob;
+  downloadBlob = () => {};   // 阻止测试触发真实下载
+  try {
+    receiver.asm = new Assembler();
+    receiver.done = false;
+    receiver.onFrame({ kind: 'header', meta: t.meta });
+    await receiver.asm.feed(t.frames[0]);
+    let last;
+    for (let i = 1; i < t.frames.length; i++) {
+      last = await receiver.asm.feed(t.frames[i]);
+      receiver.onFrame(last);
+    }
+    assertEq(last.kind, 'complete');
+    const cells = document.getElementById('chunk-grid').children;
+    assertEq(cells.length, t.meta.chunks);
+    for (let i = 0; i < cells.length; i++) {
+      assert(cells[i].classList.contains('got'), '格子 ' + i + ' 未变绿');
+    }
+  } finally {
+    downloadBlob = origDownload;
+    document.getElementById('chunk-grid').innerHTML = '';
+    document.getElementById('recv-result').innerHTML = '';
+    receiver.asm = new Assembler();
+    receiver.done = false;
+  }
+});
 test('hash-error 后下一轮循环可自愈', async () => {
   const data = crypto.getRandomValues(new Uint8Array(800));
   const t = await prepareTransfer('heal.bin', data, 600);
