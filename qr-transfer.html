@@ -12558,6 +12558,87 @@ function concatBytes(arrays) {
 // __PROTOCOL__
 /* ===== 传输管线 ===== */
 // __PIPELINE__
+const ALL_IN_ONE_MAX = 500;   // 整帧 ≤ 500B 时走 A 帧
+const MAX_CHUNKS = 65535;
+
+async function compressGzip(data) {
+  const s = new Blob([data]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+async function decompressGzip(data) {
+  const s = new Blob([data]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+async function sha256Hex(data) {
+  const d = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 返回 { meta, tid, frames: Uint8Array[] }；frames[0] 为 H 帧（或唯一 A 帧）
+async function prepareTransfer(name, fileData, chunkSize) {
+  const sha256 = await sha256Hex(fileData);
+  const gz = await compressGzip(fileData);
+  const comp = gz.length < fileData.length ? 'gzip' : 'none';
+  const data = comp === 'gzip' ? gz : fileData;
+  const tid = Math.floor(Math.random() * 256);
+  const base = { name, size: fileData.length, csize: data.length, comp, sha256 };
+  const aFrame = encodeAllInOneFrame({ ...base, chunks: 1 }, data, tid);
+  if (aFrame.length <= ALL_IN_ONE_MAX) {
+    return { meta: { ...base, chunks: 1 }, tid, frames: [aFrame] };
+  }
+  const chunks = sliceChunks(data, chunkSize);
+  if (chunks.length > MAX_CHUNKS) throw new Error('文件过大：分片数超过 ' + MAX_CHUNKS);
+  const meta = { ...base, chunks: chunks.length };
+  const frames = [encodeHeaderFrame(meta, tid)];
+  for (let i = 0; i < chunks.length; i++) frames.push(encodeDataFrame(i, chunks[i], tid));
+  return { meta, tid, frames };
+}
+
+class Assembler {
+  constructor() { this.reset(); }
+  reset() {
+    this.meta = null; this.tid = null; this.chunks = null;
+    this.received = 0; this.badFrames = 0; this.doneFlag = false;
+  }
+  // 返回 { kind: 'header'|'header-repeat'|'progress'|'complete'|'hash-error'|'ignored'|'bad', ... }
+  async feed(bytes) {
+    const f = decodeFrame(bytes);
+    if (!f) { this.badFrames++; return { kind: 'bad' }; }
+    if (this.doneFlag) {
+      // 传输已完成：仅新 tid 的头帧/整包帧可开启新传输，其余忽略
+      if (f.type === FRAME.DATA || f.tid === this.tid) return { kind: 'ignored' };
+    }
+    if (f.type === FRAME.ALL) {
+      if (this.meta && f.tid !== this.tid) this.reset();
+      return this.finish(f.meta, f.data);
+    }
+    if (f.type === FRAME.HEADER) {
+      if (!this.meta || f.tid !== this.tid) {
+        this.reset();
+        this.meta = f.meta; this.tid = f.tid;
+        this.chunks = new Array(f.meta.chunks).fill(null);
+        return { kind: 'header', meta: f.meta };
+      }
+      return { kind: 'header-repeat' };
+    }
+    // FRAME.DATA
+    if (!this.meta || f.tid !== this.tid) return { kind: 'ignored' };
+    if (f.seq >= this.meta.chunks || f.chunk.length === 0) { this.badFrames++; return { kind: 'bad' }; }
+    if (this.chunks[f.seq] === null) { this.chunks[f.seq] = f.chunk; this.received++; }
+    if (this.received === this.meta.chunks) {
+      return this.finish(this.meta, concatBytes(this.chunks));
+    }
+    return { kind: 'progress', received: this.received, total: this.meta.chunks };
+  }
+  async finish(meta, packed) {
+    let data = packed;
+    if (meta.comp === 'gzip') data = await decompressGzip(packed);
+    const hash = await sha256Hex(data);
+    if (hash !== meta.sha256) return { kind: 'hash-error', meta };
+    this.doneFlag = true;
+    return { kind: 'complete', meta, data };
+  }
+}
 /* ===== QR 图像层 ===== */
 // __QRIMAGE__
 /* ===== 发送端 ===== */
@@ -12575,6 +12656,70 @@ function route() {
 window.addEventListener('hashchange', route);
 /* ===== 测试用例 ===== */
 // __TESTS__
+test('小文件走 A 帧且自动解压还原', async () => {
+  const text = 'hello world 你好'.repeat(10);
+  const data = te.encode(text);
+  const t = await prepareTransfer('小.txt', data, 600);
+  assertEq(t.frames.length, 1, '应为单帧');
+  const asm = new Assembler();
+  const r = await asm.feed(t.frames[0]);
+  assertEq(r.kind, 'complete');
+  assertBytesEq(r.data, data);
+  assertEq(r.meta.comp, 'gzip', '重复文本应可压缩');
+});
+test('多片随机数据走 H/D 帧，乱序+重复也能收齐', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(2000));
+  const t = await prepareTransfer('rand.bin', data, 600);
+  assertEq(t.meta.comp, 'none', '随机数据不可压缩');
+  assertEq(t.frames.length, 1 + Math.ceil(2000 / 600));
+  const asm = new Assembler();
+  // 乱序投喂：先数据帧（应 ignored），再头帧，再倒序数据帧（含重复）
+  let r = await asm.feed(t.frames[1]);
+  assertEq(r.kind, 'ignored');
+  r = await asm.feed(t.frames[0]);
+  assertEq(r.kind, 'header');
+  let completed = null;
+  for (let i = t.frames.length - 1; i >= 1; i--) {
+    const r1 = await asm.feed(t.frames[i]);   // 倒序
+    const r2 = await asm.feed(t.frames[i]);   // 重复投喂
+    if (r1.kind === 'complete') completed = r1;
+    if (r2.kind === 'complete') completed = r2;
+  }
+  assert(completed, '应收齐完成');
+  assertBytesEq(completed.data, data);
+  // 完成后再收到同 tid 帧应忽略
+  const after = await asm.feed(t.frames[1]);
+  assertEq(after.kind, 'ignored');
+});
+test('tid 不匹配的数据帧被忽略', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(800));
+  const t = await prepareTransfer('a.bin', data, 600);
+  const asm = new Assembler();
+  await asm.feed(t.frames[0]);
+  const foreign = encodeDataFrame(0, new Uint8Array(100), (t.tid + 1) % 256);
+  const r = await asm.feed(foreign);
+  assertEq(r.kind, 'ignored');
+  assertEq(asm.received, 0);
+});
+test('数据损坏导致哈希不符', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(800));
+  const t = await prepareTransfer('a.bin', data, 600);
+  const asm = new Assembler();
+  await asm.feed(t.frames[0]);
+  // 篡改最后一片
+  const last = decodeFrame(t.frames[t.frames.length - 1]);
+  last.chunk[0] ^= 0xff;
+  let r;
+  for (let i = 1; i < t.frames.length - 1; i++) r = await asm.feed(t.frames[i]);
+  r = await asm.feed(encodeDataFrame(last.seq, last.chunk, t.tid));
+  assertEq(r.kind, 'hash-error');
+});
+test('分片数超 65535 拒绝', async () => {
+  let threw = false;
+  try { await prepareTransfer('big.bin', crypto.getRandomValues(new Uint8Array(70000)), 1); }
+  catch (e) { threw = true; }
+  assert(threw, '应抛异常');
+});
 test('头帧编解码回环（UTF-8 文件名）', () => {
   const meta = { name: '报告 2026.txt', size: 123, csize: 100, comp: 'gzip', chunks: 3, sha256: 'ab'.repeat(32) };
   const f = decodeFrame(encodeHeaderFrame(meta, 7));
