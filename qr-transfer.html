@@ -12515,11 +12515,12 @@ function encodeHeaderFrame(meta, tid) {
   out[0] = FRAME.HEADER; out[1] = tid; out.set(json, 2);
   return out;
 }
-function encodeDataFrame(seq, chunk, tid) {
-  const out = new Uint8Array(4 + chunk.length);
+function encodeDataFrame(seq, chunk, tid, chunks) {
+  const out = new Uint8Array(6 + chunk.length);
   out[0] = FRAME.DATA; out[1] = tid;
   out[2] = seq & 0xff; out[3] = (seq >> 8) & 0xff;
-  out.set(chunk, 4);
+  out[4] = chunks & 0xff; out[5] = (chunks >> 8) & 0xff;
+  out.set(chunk, 6);
   return out;
 }
 function encodeAllInOneFrame(meta, data, tid) {
@@ -12538,8 +12539,8 @@ function decodeFrame(bytes) {
       return { type, tid, meta: JSON.parse(td.decode(bytes.subarray(2))) };
     }
     if (type === FRAME.DATA) {
-      if (bytes.length < 4) return null;
-      return { type, tid, seq: bytes[2] | (bytes[3] << 8), chunk: bytes.slice(4) };
+      if (bytes.length < 6) return null;
+      return { type, tid, seq: bytes[2] | (bytes[3] << 8), chunks: bytes[4] | (bytes[5] << 8), chunk: bytes.slice(6) };
     }
     if (type === FRAME.ALL) {
       if (bytes.length < 4) return null;
@@ -12605,7 +12606,7 @@ async function prepareTransfer(name, fileData, chunkSize, onProgress) {
   if (chunks.length > MAX_CHUNKS) throw new Error('文件过大：分片数超过 ' + MAX_CHUNKS);
   const meta = { ...base, chunks: chunks.length };
   const frames = [encodeHeaderFrame(meta, tid)];
-  for (let i = 0; i < chunks.length; i++) frames.push(encodeDataFrame(i, chunks[i], tid));
+  for (let i = 0; i < chunks.length; i++) frames.push(encodeDataFrame(i, chunks[i], tid, chunks.length));
   progress(100, '完成');
   return { meta, tid, frames };
 }
@@ -12629,17 +12630,39 @@ class Assembler {
       return this.finish(f.meta, f.data);
     }
     if (f.type === FRAME.HEADER) {
-      if (!this.meta || f.tid !== this.tid) {
+      if (this.meta && f.tid === this.tid) return { kind: 'header-repeat' };
+      if (this.meta && f.tid !== this.tid) {
+        // 新传输的头帧：抛弃旧传输
         this.reset();
         this.meta = f.meta; this.tid = f.tid;
         this.chunks = new Array(f.meta.chunks).fill(null);
         return { kind: 'header', meta: f.meta };
       }
-      return { kind: 'header-repeat' };
+      // !this.meta：可能已有同 tid 的预收集分片
+      this.meta = f.meta;
+      if (!(this.tid === f.tid && this.chunks && this.chunks.length === f.meta.chunks)) {
+        this.tid = f.tid; this.chunks = new Array(f.meta.chunks).fill(null); this.received = 0;
+      }
+      if (this.received === this.meta.chunks) {
+        return this.finish(this.meta, concatBytes(this.chunks));   // 预收集已齐，立即校验完成
+      }
+      return { kind: 'header', meta: f.meta };
     }
     // FRAME.DATA
-    if (!this.meta || f.tid !== this.tid) return { kind: 'ignored' };
-    if (f.seq >= this.meta.chunks || f.chunk.length === 0) { this.badFrames++; return { kind: 'bad' }; }
+    if (this.meta && f.tid !== this.tid) return { kind: 'ignored' };
+    if (!this.meta) {
+      // 头帧未到：按帧内携带的 chunks 预收集，接收端可从循环任意位置加入
+      if (this.tid !== f.tid || !this.chunks) {
+        this.tid = f.tid; this.chunks = new Array(f.chunks).fill(null); this.received = 0;
+      }
+      if (f.chunks !== this.chunks.length || f.seq >= f.chunks || f.chunk.length === 0) { this.badFrames++; return { kind: 'bad' }; }
+      if (this.chunks[f.seq] === null) { this.chunks[f.seq] = f.chunk; this.received++; }
+      if (this.received === this.chunks.length) {
+        return { kind: 'awaiting-header', received: this.received, total: this.chunks.length };
+      }
+      return { kind: 'progress', received: this.received, total: this.chunks.length };
+    }
+    if (f.chunks !== this.meta.chunks || f.seq >= this.meta.chunks || f.chunk.length === 0) { this.badFrames++; return { kind: 'bad' }; }
     if (this.chunks[f.seq] === null) { this.chunks[f.seq] = f.chunk; this.received++; }
     if (this.received === this.meta.chunks) {
       return this.finish(this.meta, concatBytes(this.chunks));
@@ -12654,6 +12677,10 @@ class Assembler {
     }
   }
   async finish(meta, packed) {
+    if (packed.length !== meta.csize) {
+      this.healChunks();
+      return { kind: 'hash-error', meta };
+    }
     let data = packed;
     if (meta.comp === 'gzip') {
       try {
@@ -12901,17 +12928,25 @@ const receiver = {
       case 'header': {
         this.done = false;
         const m = r.meta;
-        document.getElementById('recv-progress').value = 0;
-        const grid = document.getElementById('chunk-grid');
-        grid.innerHTML = '';
-        for (let i = 0; i < m.chunks; i++) grid.appendChild(document.createElement('i'));
+        ensureGrid(m.chunks);
+        markChunkGrid(asm);           // 预收集的分片立即标绿
+        document.getElementById('recv-progress').value = asm.chunks ? asm.received / m.chunks : 0;
         setRecvStatus('接收中：' + m.name + '（' + m.size + ' B，' + m.chunks + ' 片）');
         break;
       }
       case 'progress': {
         document.getElementById('recv-progress').value = r.received / r.total;
+        ensureGrid(r.total);
         markChunkGrid(asm);
-        setRecvStatus('接收中：' + r.received + '/' + r.total + ' 片｜坏帧 ' + asm.badFrames);
+        setRecvStatus('接收中：' + r.received + '/' + r.total + ' 片｜坏帧 ' + asm.badFrames +
+          (asm.meta ? '' : '（预收集，等待头帧…）'));
+        break;
+      }
+      case 'awaiting-header': {
+        document.getElementById('recv-progress').value = 1;
+        ensureGrid(r.total);
+        markChunkGrid(asm);
+        setRecvStatus('已收齐 ' + r.total + ' 片，等待头帧获取文件信息并校验…');
         break;
       }
       case 'complete': {
@@ -12936,6 +12971,13 @@ const receiver = {
   },
 };
 function setRecvStatus(s) { document.getElementById('recv-status').textContent = s; }
+function ensureGrid(n) {
+  const grid = document.getElementById('chunk-grid');
+  if (grid.children.length !== n) {
+    grid.innerHTML = '';
+    for (let i = 0; i < n; i++) grid.appendChild(document.createElement('i'));
+  }
+}
 function markChunkGrid(asm) {
   if (!asm.chunks) return;          // A 帧路径无分片位图
   const cells = document.getElementById('chunk-grid').children;
@@ -13035,7 +13077,7 @@ test('hash-error 后下一轮循环可自愈', async () => {
   const last = decodeFrame(t.frames[t.frames.length - 1]);
   const badChunk = last.chunk.slice(); badChunk[0] ^= 0xff;
   for (let i = 1; i < t.frames.length - 1; i++) await asm.feed(t.frames[i]);
-  const r1 = await asm.feed(encodeDataFrame(last.seq, badChunk, t.tid));
+  const r1 = await asm.feed(encodeDataFrame(last.seq, badChunk, t.tid, t.meta.chunks));
   assertEq(r1.kind, 'hash-error');
   // 下一轮循环：头帧（header-repeat）+ 全部正确帧
   await asm.feed(t.frames[0]);
@@ -13059,7 +13101,7 @@ test('gzip 数据损坏解压失败归入 hash-error 而非抛异常', async () 
   const last = decodeFrame(t.frames[t.frames.length - 1]);
   const badChunk = last.chunk.slice(); badChunk[5] ^= 0xff; badChunk[10] ^= 0xff;
   for (let i = 1; i < t.frames.length - 1; i++) await asm.feed(t.frames[i]);
-  const r = await asm.feed(encodeDataFrame(last.seq, badChunk, t.tid));
+  const r = await asm.feed(encodeDataFrame(last.seq, badChunk, t.tid, t.meta.chunks));
   assertEq(r.kind, 'hash-error', '解压失败应归入 hash-error');
   // 损坏帧导致 hash-error 后，下一轮循环的正确帧应能自愈
   await asm.feed(t.frames[0]);
@@ -13084,7 +13126,7 @@ test('QR 渲染→jsQR 解码回环（三种帧）', async () => {
 });
 test('最大分片（1000B）可渲染可解码', () => {
   const chunk = crypto.getRandomValues(new Uint8Array(1000));
-  const frame = encodeDataFrame(3, chunk, 1);
+  const frame = encodeDataFrame(3, chunk, 1, 10);
   const canvas = document.createElement('canvas');
   renderFrameToCanvas(frame, canvas, 700);
   assertBytesEq(decodeQRFromCanvas(canvas), frame);
@@ -13106,9 +13148,10 @@ test('多片随机数据走 H/D 帧，乱序+重复也能收齐', async () => {
   assertEq(t.meta.comp, 'none', '随机数据不可压缩');
   assertEq(t.frames.length, 1 + Math.ceil(2000 / 600));
   const asm = new Assembler();
-  // 乱序投喂：先数据帧（应 ignored），再头帧，再倒序数据帧（含重复）
+  // 乱序投喂：先数据帧（无头帧预收集），再头帧，再倒序数据帧（含重复）
   let r = await asm.feed(t.frames[1]);
-  assertEq(r.kind, 'ignored');
+  assertEq(r.kind, 'progress');
+  assertEq(asm.received, 1, '无头帧也应预收集');
   r = await asm.feed(t.frames[0]);
   assertEq(r.kind, 'header');
   let completed = null;
@@ -13129,7 +13172,7 @@ test('tid 不匹配的数据帧被忽略', async () => {
   const t = await prepareTransfer('a.bin', data, 600);
   const asm = new Assembler();
   await asm.feed(t.frames[0]);
-  const foreign = encodeDataFrame(0, new Uint8Array(100), (t.tid + 1) % 256);
+  const foreign = encodeDataFrame(0, new Uint8Array(100), (t.tid + 1) % 256, t.meta.chunks);
   const r = await asm.feed(foreign);
   assertEq(r.kind, 'ignored');
   assertEq(asm.received, 0);
@@ -13144,7 +13187,7 @@ test('数据损坏导致哈希不符', async () => {
   last.chunk[0] ^= 0xff;
   let r;
   for (let i = 1; i < t.frames.length - 1; i++) r = await asm.feed(t.frames[i]);
-  r = await asm.feed(encodeDataFrame(last.seq, last.chunk, t.tid));
+  r = await asm.feed(encodeDataFrame(last.seq, last.chunk, t.tid, t.meta.chunks));
   assertEq(r.kind, 'hash-error');
 });
 test('分片数超 65535 拒绝', async () => {
@@ -13159,10 +13202,47 @@ test('头帧编解码回环（UTF-8 文件名）', () => {
   assertEq(f.type, 0x48); assertEq(f.tid, 7);
   assertEq(f.meta.name, '报告 2026.txt'); assertEq(f.meta.chunks, 3); assertEq(f.meta.sha256, meta.sha256);
 });
+test('数据帧预收集：无头帧直接开收，收齐后头帧到达即完成', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(1500));
+  const t = await prepareTransfer('pre.bin', data, 600);   // 3 片
+  const asm = new Assembler();
+  // 不等头帧，先倒序收数据帧
+  let r;
+  for (let i = t.frames.length - 1; i >= 2; i--) r = await asm.feed(t.frames[i]);
+  assertEq(r.kind, 'progress');
+  assertEq(asm.received, t.meta.chunks - 1);
+  // 最后一片 → 收齐但无头帧，等待校验
+  r = await asm.feed(t.frames[1]);
+  assertEq(r.kind, 'awaiting-header');
+  // 头帧到达 → 立即完成（无需重收任何帧）
+  r = await asm.feed(t.frames[0]);
+  assertEq(r.kind, 'complete');
+  assertBytesEq(r.data, data);
+});
+test('预收集中途头帧到达：已收分片保留', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(1500));
+  const t = await prepareTransfer('pre2.bin', data, 600);
+  const asm = new Assembler();
+  let r = await asm.feed(t.frames[2]);   // 先收一片
+  assertEq(r.kind, 'progress');
+  r = await asm.feed(t.frames[0]);       // 头帧到达
+  assertEq(r.kind, 'header');
+  assertEq(asm.received, 1, '已收分片应保留');
+  for (let i = 1; i < t.frames.length; i++) r = await asm.feed(t.frames[i]);
+  assertEq(r.kind, 'complete');
+  assertBytesEq(r.data, data);
+});
+test('预收集时 chunks 字段不一致判坏帧', async () => {
+  const t = await prepareTransfer('c.bin', crypto.getRandomValues(new Uint8Array(1200)), 600);
+  const asm = new Assembler();
+  await asm.feed(t.frames[1]);
+  const r = await asm.feed(encodeDataFrame(0, new Uint8Array(100), t.tid, 99));
+  assertEq(r.kind, 'bad');
+});
 test('数据帧编解码回环（全字节值）', () => {
   const chunk = new Uint8Array(256); for (let i = 0; i < 256; i++) chunk[i] = i;
-  const f = decodeFrame(encodeDataFrame(65535, chunk, 200));
-  assertEq(f.type, 0x44); assertEq(f.tid, 200); assertEq(f.seq, 65535);
+  const f = decodeFrame(encodeDataFrame(65535, chunk, 200, 65535));
+  assertEq(f.type, 0x44); assertEq(f.tid, 200); assertEq(f.seq, 65535); assertEq(f.chunks, 65535);
   assertBytesEq(f.chunk, chunk);
 });
 test('整包帧编解码回环', () => {
