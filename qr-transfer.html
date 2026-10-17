@@ -12632,9 +12632,20 @@ class Assembler {
   }
   async finish(meta, packed) {
     let data = packed;
-    if (meta.comp === 'gzip') data = await decompressGzip(packed);
+    if (meta.comp === 'gzip') {
+      try {
+        data = await decompressGzip(packed);
+      } catch (e) {
+        // 解压失败按 hash-error 处理，避免 unhandled rejection 及后续重复触发
+        return { kind: 'hash-error', meta, error: e.message };
+      }
+    }
     const hash = await sha256Hex(data);
-    if (hash !== meta.sha256) return { kind: 'hash-error', meta };
+    if (hash !== meta.sha256) {
+      // 清空已收分片（保留 meta/tid），等待下一轮循环的正确帧自愈；A 帧路径 chunks 为 null 需防护
+      if (this.chunks) { this.chunks = new Array(this.meta.chunks).fill(null); this.received = 0; }
+      return { kind: 'hash-error', meta };
+    }
     this.doneFlag = true;
     return { kind: 'complete', meta, data };
   }
@@ -12691,6 +12702,8 @@ const sender = {
   loops: 0,
   async setFile(file) {
     this.pause();
+    // 入口同步禁用「开始」：prepareTransfer 耗时期间防止以旧 transfer 启动定时器
+    document.getElementById('btn-send-start').disabled = true;
     const chunkSize = +document.getElementById('opt-chunk').value;
     const data = new Uint8Array(await file.arrayBuffer());
     try {
@@ -12699,6 +12712,8 @@ const sender = {
       setSendStatus('错误：' + e.message);
       return;
     }
+    // 窗口期内可能已被点击启动定时器，再次 pause 清除（成功路径末尾会重新启用按钮）
+    this.pause();
     this.qrModels = null; this.idx = 0; this.loops = 0;
     const m = this.transfer.meta;
     setSendStatus(
@@ -12771,13 +12786,17 @@ const receiver = {
   asm: new Assembler(),
   done: false,
   async startCapture() {
+    // 首行同步禁用：getDisplayMedia 期间防止双击发起两次抓屏导致 stream/定时器泄漏
+    document.getElementById('btn-capture').disabled = true;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      document.getElementById('btn-capture').disabled = false;
       setRecvStatus('当前环境不支持抓屏：请以 file://、localhost 或 https 打开本页（内网 http://裸IP 不可用）。');
       return;
     }
     try {
       this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
     } catch (e) {
+      document.getElementById('btn-capture').disabled = false;
       setRecvStatus('抓屏被拒绝：' + e.message + '\n提示：需 file://、localhost 或 https 环境。');
       return;
     }
@@ -12815,7 +12834,9 @@ const receiver = {
       if (!this.asm.meta && !this.done) setRecvStatus('未检测到二维码：请确认发送端在播放且窗口未被遮挡');
       return;
     }
-    this.asm.feed(bytes).then(r => this.onFrame(r));
+    this.asm.feed(bytes)
+      .then(r => this.onFrame(r))
+      .catch(e => setRecvStatus('解码错误：' + e.message));
   },
   onFrame(r) {
     const asm = this.asm;
@@ -12891,6 +12912,41 @@ function route() {
 window.addEventListener('hashchange', route);
 /* ===== 测试用例 ===== */
 // __TESTS__
+test('hash-error 后下一轮循环可自愈', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(800));
+  const t = await prepareTransfer('heal.bin', data, 600);
+  const asm = new Assembler();
+  await asm.feed(t.frames[0]);
+  const last = decodeFrame(t.frames[t.frames.length - 1]);
+  const badChunk = last.chunk.slice(); badChunk[0] ^= 0xff;
+  for (let i = 1; i < t.frames.length - 1; i++) await asm.feed(t.frames[i]);
+  const r1 = await asm.feed(encodeDataFrame(last.seq, badChunk, t.tid));
+  assertEq(r1.kind, 'hash-error');
+  // 下一轮循环：头帧（header-repeat）+ 全部正确帧
+  await asm.feed(t.frames[0]);
+  let completed = null;
+  for (let i = 1; i < t.frames.length; i++) {
+    const r = await asm.feed(t.frames[i]);
+    if (r.kind === 'complete') completed = r;
+  }
+  assert(completed, '自愈后应收齐完成');
+  assertBytesEq(completed.data, data);
+});
+test('gzip 数据损坏解压失败归入 hash-error 而非抛异常', async () => {
+  // 头部可压缩 + 尾部随机：保证 gzip 后仍 > 500B（走 H/D 多片路径而非整包 A 帧）
+  const data = new Uint8Array(6000);
+  data.set(te.encode('可压缩文本'.repeat(200)), 0);
+  crypto.getRandomValues(data.subarray(3000));
+  const t = await prepareTransfer('gz.txt', data, 600);
+  assertEq(t.meta.comp, 'gzip');
+  const asm = new Assembler();
+  await asm.feed(t.frames[0]);
+  const last = decodeFrame(t.frames[t.frames.length - 1]);
+  const badChunk = last.chunk.slice(); badChunk[5] ^= 0xff; badChunk[10] ^= 0xff;
+  for (let i = 1; i < t.frames.length - 1; i++) await asm.feed(t.frames[i]);
+  const r = await asm.feed(encodeDataFrame(last.seq, badChunk, t.tid));
+  assertEq(r.kind, 'hash-error', '解压失败应归入 hash-error');
+});
 test('QR 渲染→jsQR 解码回环（三种帧）', async () => {
   const data = crypto.getRandomValues(new Uint8Array(400));
   const t = await prepareTransfer('img.bin', data, 600);
