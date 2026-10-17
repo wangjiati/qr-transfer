@@ -12765,6 +12765,121 @@ function initSender() {
 initSender();
 /* ===== 接收端 ===== */
 // __RECEIVER__
+const receiver = {
+  stream: null,
+  timer: null,
+  asm: new Assembler(),
+  done: false,
+  async startCapture() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      setRecvStatus('当前环境不支持抓屏：请以 file://、localhost 或 https 打开本页（内网 http://裸IP 不可用）。');
+      return;
+    }
+    try {
+      this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+    } catch (e) {
+      setRecvStatus('抓屏被拒绝：' + e.message + '\n提示：需 file://、localhost 或 https 环境。');
+      return;
+    }
+    const video = document.getElementById('capture-video');
+    video.srcObject = this.stream;
+    this.stream.getVideoTracks()[0].addEventListener('ended', () => this.stopCapture('抓屏已结束'));
+    this.timer = setInterval(() => this.tick(), 150);
+    document.getElementById('btn-capture').disabled = true;
+    document.getElementById('btn-recv-reset').disabled = false;
+    setRecvStatus('解码中：等待头帧…（请确认发送端在播放且窗口未被遮挡）');
+  },
+  stopCapture(msg) {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
+    document.getElementById('btn-capture').disabled = false;
+    if (msg) setRecvStatus(msg);
+  },
+  reset() {
+    this.asm.reset(); this.done = false;
+    document.getElementById('chunk-grid').innerHTML = '';
+    document.getElementById('recv-result').innerHTML = '';
+    document.getElementById('recv-progress').value = 0;
+    setRecvStatus(this.timer ? '解码中：等待头帧…' : '等待抓屏');
+  },
+  scratch: null,
+  tick() {
+    const video = document.getElementById('capture-video');
+    if (video.readyState < 2 || !video.videoWidth) return;
+    if (!this.scratch) this.scratch = document.createElement('canvas');
+    const c = this.scratch;
+    c.width = video.videoWidth; c.height = video.videoHeight;
+    c.getContext('2d').drawImage(video, 0, 0);
+    const bytes = decodeQRFromCanvas(c);
+    if (!bytes) {
+      if (!this.asm.meta && !this.done) setRecvStatus('未检测到二维码：请确认发送端在播放且窗口未被遮挡');
+      return;
+    }
+    this.asm.feed(bytes).then(r => this.onFrame(r));
+  },
+  onFrame(r) {
+    const asm = this.asm;
+    switch (r.kind) {
+      case 'bad':
+        setRecvStatus(asm.meta
+          ? '接收中：' + asm.received + '/' + asm.meta.chunks + ' 片｜坏帧 ' + asm.badFrames
+          : '等待头帧…（坏帧 ' + asm.badFrames + '）');
+        break;
+      case 'header-repeat':   // 循环播放时每圈重复出现的同 tid 头帧
+      case 'ignored':
+        break;
+      case 'header': {
+        this.done = false;
+        const m = r.meta;
+        document.getElementById('recv-progress').value = 0;
+        const grid = document.getElementById('chunk-grid');
+        grid.innerHTML = '';
+        for (let i = 0; i < m.chunks; i++) grid.appendChild(document.createElement('i'));
+        setRecvStatus('接收中：' + m.name + '（' + m.size + ' B，' + m.chunks + ' 片）');
+        break;
+      }
+      case 'progress': {
+        document.getElementById('recv-progress').value = r.received / r.total;
+        const cells = document.getElementById('chunk-grid').children;
+        for (let i = 0; i < asm.chunks.length; i++) {
+          if (asm.chunks[i] !== null) cells[i].classList.add('got');
+        }
+        setRecvStatus('接收中：' + r.received + '/' + r.total + ' 片｜坏帧 ' + asm.badFrames);
+        break;
+      }
+      case 'complete': {
+        if (this.done) break;         // 循环播放会反复 complete，只处理一次
+        this.done = true;
+        document.getElementById('recv-progress').value = 1;
+        const m = r.meta;
+        setRecvStatus('完成：' + m.name + '（' + m.size + ' B）✔ SHA-256 校验通过');
+        const btn = document.createElement('button');
+        btn.textContent = '重新下载 ' + m.name;
+        btn.addEventListener('click', () => downloadBlob(m.name, r.data));
+        const res = document.getElementById('recv-result');
+        res.innerHTML = ''; res.appendChild(btn);
+        downloadBlob(m.name, r.data);
+        break;
+      }
+      case 'hash-error':
+        setRecvStatus('错误：SHA-256 校验不符。请让发送端重新发送，或降低帧率/分片后重试（本端继续接收中）。');
+        break;
+    }
+  },
+};
+function setRecvStatus(s) { document.getElementById('recv-status').textContent = s; }
+function downloadBlob(name, data) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([data]));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+function initReceiver() {
+  document.getElementById('btn-capture').addEventListener('click', () => receiver.startCapture());
+  document.getElementById('btn-recv-reset').addEventListener('click', () => receiver.reset());
+}
+initReceiver();
 /* ===== 路由 ===== */
 function route() {
   const mode = (location.hash || '#home').slice(1);
