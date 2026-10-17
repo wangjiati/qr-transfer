@@ -12497,6 +12497,64 @@ async function runAllTests() {
   document.title = summary;
 }
 /* ===== 协议层 ===== */
+const FRAME = { HEADER: 0x48, DATA: 0x44, ALL: 0x41 };
+const te = new TextEncoder();
+const td = new TextDecoder();
+
+function encodeHeaderFrame(meta, tid) {
+  const json = te.encode(JSON.stringify(meta));
+  const out = new Uint8Array(2 + json.length);
+  out[0] = FRAME.HEADER; out[1] = tid; out.set(json, 2);
+  return out;
+}
+function encodeDataFrame(seq, chunk, tid) {
+  const out = new Uint8Array(4 + chunk.length);
+  out[0] = FRAME.DATA; out[1] = tid;
+  out[2] = seq & 0xff; out[3] = (seq >> 8) & 0xff;
+  out.set(chunk, 4);
+  return out;
+}
+function encodeAllInOneFrame(meta, data, tid) {
+  const json = te.encode(JSON.stringify(meta));
+  const out = new Uint8Array(4 + json.length + data.length);
+  out[0] = FRAME.ALL; out[1] = tid;
+  out[2] = json.length & 0xff; out[3] = (json.length >> 8) & 0xff;
+  out.set(json, 4); out.set(data, 4 + json.length);
+  return out;
+}
+function decodeFrame(bytes) {
+  if (!bytes || bytes.length < 2) return null;
+  const type = bytes[0], tid = bytes[1];
+  try {
+    if (type === FRAME.HEADER) {
+      return { type, tid, meta: JSON.parse(td.decode(bytes.subarray(2))) };
+    }
+    if (type === FRAME.DATA) {
+      if (bytes.length < 4) return null;
+      return { type, tid, seq: bytes[2] | (bytes[3] << 8), chunk: bytes.slice(4) };
+    }
+    if (type === FRAME.ALL) {
+      if (bytes.length < 4) return null;
+      const jsonLen = bytes[2] | (bytes[3] << 8);
+      if (bytes.length < 4 + jsonLen) return null;
+      const meta = JSON.parse(td.decode(bytes.subarray(4, 4 + jsonLen)));
+      return { type, tid, meta, data: bytes.slice(4 + jsonLen) };
+    }
+    return null;
+  } catch (e) { return null; }
+}
+function sliceChunks(data, size) {
+  const chunks = [];
+  for (let i = 0; i < data.length; i += size) chunks.push(data.subarray(i, i + size));
+  return chunks;
+}
+function concatBytes(arrays) {
+  const total = arrays.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const a of arrays) { out.set(a, off); off += a.length; }
+  return out;
+}
 // __PROTOCOL__
 /* ===== 传输管线 ===== */
 // __PIPELINE__
@@ -12517,6 +12575,37 @@ function route() {
 window.addEventListener('hashchange', route);
 /* ===== 测试用例 ===== */
 // __TESTS__
+test('头帧编解码回环（UTF-8 文件名）', () => {
+  const meta = { name: '报告 2026.txt', size: 123, csize: 100, comp: 'gzip', chunks: 3, sha256: 'ab'.repeat(32) };
+  const f = decodeFrame(encodeHeaderFrame(meta, 7));
+  assertEq(f.type, 0x48); assertEq(f.tid, 7);
+  assertEq(f.meta.name, '报告 2026.txt'); assertEq(f.meta.chunks, 3); assertEq(f.meta.sha256, meta.sha256);
+});
+test('数据帧编解码回环（全字节值）', () => {
+  const chunk = new Uint8Array(256); for (let i = 0; i < 256; i++) chunk[i] = i;
+  const f = decodeFrame(encodeDataFrame(65535, chunk, 200));
+  assertEq(f.type, 0x44); assertEq(f.tid, 200); assertEq(f.seq, 65535);
+  assertBytesEq(f.chunk, chunk);
+});
+test('整包帧编解码回环', () => {
+  const meta = { name: 'a.bin', size: 4, csize: 4, comp: 'none', chunks: 1, sha256: '00'.repeat(32) };
+  const data = new Uint8Array([1, 2, 3, 4]);
+  const f = decodeFrame(encodeAllInOneFrame(meta, data, 9));
+  assertEq(f.type, 0x41); assertEq(f.meta.name, 'a.bin'); assertBytesEq(f.data, data);
+});
+test('坏帧返回 null', () => {
+  assertEq(decodeFrame(null), null);
+  assertEq(decodeFrame(new Uint8Array([])), null);
+  assertEq(decodeFrame(new Uint8Array([0x99, 0, 1, 2])), null, '未知类型');
+  assertEq(decodeFrame(new Uint8Array([0x44, 0, 1])), null, '数据帧过短');
+  assertEq(decodeFrame(new Uint8Array([0x48, 0, 0xff, 0xfe])), null, 'JSON 损坏');
+});
+test('切片与拼接', () => {
+  const data = new Uint8Array(7); for (let i = 0; i < 7; i++) data[i] = i;
+  const chunks = sliceChunks(data, 3);
+  assertEq(chunks.length, 3); assertEq(chunks[2].length, 1);
+  assertBytesEq(concatBytes(chunks), data);
+});
 test('库已加载', () => {
   assert(typeof qrcode === 'function', 'qrcode-generator 未加载');
   assert(typeof jsQR === 'function', 'jsQR 未加载');
