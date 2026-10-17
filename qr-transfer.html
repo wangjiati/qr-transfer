@@ -12630,6 +12630,13 @@ class Assembler {
     }
     return { kind: 'progress', received: this.received, total: this.meta.chunks };
   }
+  healChunks() {
+    // 清空已收分片（保留 meta/tid），等待下一轮循环的正确帧自愈；A 帧路径 chunks 为 null 需防护
+    if (this.chunks) {
+      this.chunks = new Array(this.meta.chunks).fill(null);
+      this.received = 0;
+    }
+  }
   async finish(meta, packed) {
     let data = packed;
     if (meta.comp === 'gzip') {
@@ -12637,13 +12644,13 @@ class Assembler {
         data = await decompressGzip(packed);
       } catch (e) {
         // 解压失败按 hash-error 处理，避免 unhandled rejection 及后续重复触发
+        this.healChunks();
         return { kind: 'hash-error', meta, error: e.message };
       }
     }
     const hash = await sha256Hex(data);
     if (hash !== meta.sha256) {
-      // 清空已收分片（保留 meta/tid），等待下一轮循环的正确帧自愈；A 帧路径 chunks 为 null 需防护
-      if (this.chunks) { this.chunks = new Array(this.meta.chunks).fill(null); this.received = 0; }
+      this.healChunks();
       return { kind: 'hash-error', meta };
     }
     this.doneFlag = true;
@@ -12946,6 +12953,15 @@ test('gzip 数据损坏解压失败归入 hash-error 而非抛异常', async () 
   for (let i = 1; i < t.frames.length - 1; i++) await asm.feed(t.frames[i]);
   const r = await asm.feed(encodeDataFrame(last.seq, badChunk, t.tid));
   assertEq(r.kind, 'hash-error', '解压失败应归入 hash-error');
+  // 损坏帧导致 hash-error 后，下一轮循环的正确帧应能自愈
+  await asm.feed(t.frames[0]);
+  let completed = null;
+  for (let i = 1; i < t.frames.length; i++) {
+    const r2 = await asm.feed(t.frames[i]);
+    if (r2.kind === 'complete') completed = r2;
+  }
+  assert(completed, 'gzip 损坏自愈后应收齐完成');
+  assertBytesEq(completed.data, data);
 });
 test('QR 渲染→jsQR 解码回环（三种帧）', async () => {
   const data = crypto.getRandomValues(new Uint8Array(400));
