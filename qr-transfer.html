@@ -12416,7 +12416,7 @@ header h1 { font-size: 15px; margin: 0; }
 nav a { color: #9cf; margin-right: 12px; text-decoration: none; font-size: 13px; }
 main { padding: 8px; max-width: 1100px; margin: 0 auto; }
 #qr-canvas { background: #fff; display: block; margin: 6px auto; box-shadow: 0 0 0 1px #ccc; }
-#drop-zone { border: 2px dashed #999; padding: 4px 10px; text-align: center; border-radius: 6px; background: #fff; font-size: 13px; }
+#drop-zone { display: inline-flex; align-items: center; border: 1px dashed #999; padding: 2px 8px; border-radius: 6px; background: #fff; font-size: 12px; }
 #drop-zone.drag { border-color: #06c; background: #eef6ff; }
 .status { margin-top: 4px; font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; font-size: 12px; }
 .controls { margin: 6px 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
@@ -12446,9 +12446,9 @@ video { max-width: 320px; background: #000; }
     <p class="note">接收端必须以 file:// 双击、localhost 或 https 方式打开；内网 http://裸IP 访问时浏览器会禁止抓屏。</p>
   </section>
   <section id="view-send" style="display:none">
-    <div id="drop-zone">拖放文件到这里，或 <input type="file" id="file-input"></div>
     <div class="controls">
-      <label>帧率 <input type="range" id="opt-fps" min="2" max="10" value="5"> <b id="opt-fps-val">5</b> fps</label>
+      <span id="drop-zone">拖放文件到这里，或 <input type="file" id="file-input" style="max-width:210px; font-size:12px"></span>
+      <label>帧率 <input type="range" id="opt-fps" min="2" max="10" value="4" style="width:70px; vertical-align:middle"> <b id="opt-fps-val">4</b> fps</label>
       <label>分片 <select id="opt-chunk">
         <option value="300">300</option>
         <option value="600" selected>600</option>
@@ -12818,8 +12818,8 @@ function nextFrame() { return new Promise(r => requestAnimationFrame(() => reque
 function qrMaxPx() {
   const v = document.getElementById('opt-size').value;
   if (v !== 'auto') return +v;
-  // 自适应：扣除头部/控件/拖放区/状态栏后的可用面积
-  return Math.max(200, Math.min(window.innerWidth - 32, window.innerHeight - 180));
+  // 自适应：扣除头部/控件行/状态栏后的可用面积
+  return Math.max(200, Math.min(window.innerWidth - 32, window.innerHeight - 130));
 }
 function setSendStatus(s) { document.getElementById('send-status').textContent = s; }
 function updateSendProgress() {
