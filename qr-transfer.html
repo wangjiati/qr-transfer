@@ -12641,6 +12641,46 @@ class Assembler {
 }
 /* ===== QR 图像层 ===== */
 // __QRIMAGE__
+// 二进制 → latin1 字符串（qrcode-generator 的 Byte 模式按 charCodeAt & 0xff 处理）
+function bytesToLatin1(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return s;
+}
+function buildQrModel(frame) {
+  const qr = qrcode(0, 'M');        // 0 = 版本号自动，M = 纠错 15%
+  qr.addData(bytesToLatin1(frame), 'Byte');
+  qr.make();
+  return qr;
+}
+function drawQrModel(qr, canvas, maxPx) {
+  const count = qr.getModuleCount();
+  const quiet = 4;
+  const total = count + quiet * 2;
+  const px = Math.max(2, Math.floor(maxPx / total));
+  const size = total * px;
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = '#000';
+  for (let r = 0; r < count; r++) {
+    for (let c = 0; c < count; c++) {
+      if (qr.isDark(r, c)) ctx.fillRect((c + quiet) * px, (r + quiet) * px, px, px);
+    }
+  }
+}
+function renderFrameToCanvas(frame, canvas, maxPx) {
+  drawQrModel(buildQrModel(frame), canvas, maxPx);
+}
+// 从 canvas 解码；返回 Uint8Array 或 null
+function decodeQRFromCanvas(canvas) {
+  const ctx = canvas.getContext('2d');
+  const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const res = jsQR(img.data, img.width, img.height);
+  return res ? new Uint8Array(res.binaryData) : null;
+}
 /* ===== 发送端 ===== */
 // __SENDER__
 /* ===== 接收端 ===== */
@@ -12656,6 +12696,24 @@ function route() {
 window.addEventListener('hashchange', route);
 /* ===== 测试用例 ===== */
 // __TESTS__
+test('QR 渲染→jsQR 解码回环（三种帧）', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(400));
+  const t = await prepareTransfer('img.bin', data, 600);
+  for (const frame of t.frames) {
+    const canvas = document.createElement('canvas');
+    renderFrameToCanvas(frame, canvas, 600);
+    const decoded = decodeQRFromCanvas(canvas);
+    assert(decoded, 'jsQR 未识别');
+    assertBytesEq(decoded, frame);
+  }
+});
+test('最大分片（1000B）可渲染可解码', () => {
+  const chunk = crypto.getRandomValues(new Uint8Array(1000));
+  const frame = encodeDataFrame(3, chunk, 1);
+  const canvas = document.createElement('canvas');
+  renderFrameToCanvas(frame, canvas, 700);
+  assertBytesEq(decodeQRFromCanvas(canvas), frame);
+});
 test('小文件走 A 帧且自动解压还原', async () => {
   const text = 'hello world 你好'.repeat(10);
   const data = te.encode(text);
