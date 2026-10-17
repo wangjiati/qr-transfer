@@ -19,4 +19,4 @@ DIR="$(cd "$(dirname "$0")/.." && pwd -W 2>/dev/null || pwd)"
 OUT="$("$CHROME" --headless=new --disable-gpu --virtual-time-budget=20000 --dump-dom "file:///${DIR}/qr-transfer.html#test" 2>/dev/null)"
 echo "$OUT" | grep -oE 'TEST-SUMMARY: [^<]*' || echo "未找到 TEST-SUMMARY（页面可能未运行）"
 echo "$OUT" | grep -oE '<div class="fail">[^<]*' || true
-if echo "$OUT" | grep -q 'ALL PASS'; then echo "PASS"; exit 0; else echo "FAIL"; exit 1; fi
+if echo "$OUT" | grep -q 'TEST-SUMMARY: ALL PASS'; then echo "PASS"; exit 0; else echo "FAIL"; exit 1; fi
