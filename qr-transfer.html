@@ -12942,7 +12942,7 @@ const receiver = {
       UA: navigator.userAgent
     });
     this.lastSig = null; this.lastSigOk = false; this.lastAttempt = 0;
-    this.loggedVideo = false; this.failStreak = 0; this.failTotal = 0; this.lastOkAt = 0; this.lastFailLog = 0;
+    this.loggedVideo = false; this.failStreak = 0; this.failTotal = 0; this.lastOkAt = 0; this.lastFailLog = 0; this.lastRvfcWarnAt = 0;
     this.stats = { t0: performance.now(), ticks: 0, rvfc: 0, changes: 0, attempts: 0, oks: 0, ms: 0 };
     document.getElementById('recv-stats').textContent = '';
     this.hasRvfc = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
@@ -12987,6 +12987,7 @@ const receiver = {
   failTotal: 0,
   lastOkAt: 0,
   lastFailLog: 0,
+  lastRvfcWarnAt: 0,
   stats: null,           // 每秒统计：抓屏帧率 / 解码耗时，用于诊断漏帧
   flushStats(now) {
     const st = this.stats;
@@ -13018,7 +13019,11 @@ const receiver = {
       解码失败累计: this.failTotal
     });
     if (this.hasRvfc && st.rvfc === 0) {
-      rlog('警告：本轮 rVFC 无新帧', { 提示: '被捕获窗口可能被遮挡、最小化或抓屏已暂停' });
+      // 完成后不再告警；未完成时最多每 5 秒提示一次，避免遮挡期间刷屏
+      if (!this.done && now - this.lastRvfcWarnAt >= 5000) {
+        this.lastRvfcWarnAt = now;
+        rlog('警告：本轮 rVFC 无新帧', { 提示: '被捕获窗口可能被遮挡、最小化或抓屏已暂停' });
+      }
     }
     st.t0 = now; st.ticks = 0; st.rvfc = 0; st.changes = 0; st.attempts = 0; st.oks = 0; st.ms = 0;
   },
