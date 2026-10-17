@@ -12448,7 +12448,7 @@ video { max-width: 320px; background: #000; }
   <section id="view-send" style="display:none">
     <div class="controls">
       <span id="drop-zone">拖放文件到这里，或 <input type="file" id="file-input" style="max-width:210px; font-size:12px"></span>
-      <label>帧率 <input type="range" id="opt-fps" min="2" max="10" value="4" style="width:70px; vertical-align:middle"> <b id="opt-fps-val">4</b> fps</label>
+      <label>帧率 <input type="range" id="opt-fps" min="2" max="5" value="5" style="width:70px; vertical-align:middle"> <b id="opt-fps-val">5</b> fps</label>
       <label>分片 <select id="opt-chunk">
         <option value="300">300</option>
         <option value="600" selected>600</option>
@@ -12657,18 +12657,20 @@ class Assembler {
         this.tid = f.tid; this.chunks = new Array(f.chunks).fill(null); this.received = 0;
       }
       if (f.chunks !== this.chunks.length || f.seq >= f.chunks || f.chunk.length === 0) { this.badFrames++; return { kind: 'bad' }; }
-      if (this.chunks[f.seq] === null) { this.chunks[f.seq] = f.chunk; this.received++; }
+      const isNew = this.chunks[f.seq] === null;
+      if (isNew) { this.chunks[f.seq] = f.chunk; this.received++; }
       if (this.received === this.chunks.length) {
         return { kind: 'awaiting-header', received: this.received, total: this.chunks.length };
       }
-      return { kind: 'progress', received: this.received, total: this.chunks.length };
+      return { kind: 'progress', received: this.received, total: this.chunks.length, seq: f.seq, isNew };
     }
     if (f.chunks !== this.meta.chunks || f.seq >= this.meta.chunks || f.chunk.length === 0) { this.badFrames++; return { kind: 'bad' }; }
-    if (this.chunks[f.seq] === null) { this.chunks[f.seq] = f.chunk; this.received++; }
+    const isNew = this.chunks[f.seq] === null;
+    if (isNew) { this.chunks[f.seq] = f.chunk; this.received++; }
     if (this.received === this.meta.chunks) {
       return this.finish(this.meta, concatBytes(this.chunks));
     }
-    return { kind: 'progress', received: this.received, total: this.meta.chunks };
+    return { kind: 'progress', received: this.received, total: this.meta.chunks, seq: f.seq, isNew };
   }
   healChunks() {
     // 清空已收分片（保留 meta/tid），等待下一轮循环的正确帧自愈；A 帧路径 chunks 为 null 需防护
@@ -12758,12 +12760,20 @@ function fitDecodeSize(vw, vh, maxDim) {
 }
 /* ===== 发送端 ===== */
 // __SENDER__
+const SEND_LOG = true;
+function slog(...args) {
+  if (!SEND_LOG) return;
+  console.log('[QR发送]', ...args.map(a => typeof a === 'string' ? a : JSON.stringify(a)));
+}
 const sender = {
   transfer: null,      // { meta, tid, frames }
   qrVersion: 0,        // 统一 QR 版本（由 pickQrVersion 探测）
   timer: null,
   idx: 0,
   loops: 0,
+  loopStart: 0,
+  renderMs: 0,
+  rendered: 0,
   async setFile(file) {
     this.pause();
     // 入口同步禁用「开始」：prepareTransfer 耗时期间防止以旧 transfer 启动定时器
@@ -12806,11 +12816,32 @@ const sender = {
     const fps = +document.getElementById('opt-fps').value;
     const n = this.transfer.frames.length;
     const canvas = document.getElementById('qr-canvas');
+    this.loopStart = performance.now(); this.renderMs = 0; this.rendered = 0;
+    slog('开始', {
+      fps, 帧间隔ms: Math.round(1000 / fps), 帧数: n, 分片: this.transfer.meta.chunks,
+      QR版本: this.qrVersion, 画布: canvas.width + '×' + canvas.height,
+      屏幕: window.screen.width + '×' + window.screen.height,
+      窗口: window.innerWidth + '×' + window.innerHeight,
+      DPR: window.devicePixelRatio
+    });
     this.timer = setInterval(() => {
+      const t0 = performance.now();
       // 按需构建当前帧：不预建全量模型（大文件几千帧会冻结 UI 并耗费数 GB 内存）
       drawQrModel(buildQrModel(this.transfer.frames[this.idx], this.qrVersion), canvas, qrMaxPx());
+      this.renderMs += performance.now() - t0;
+      this.rendered++;
       this.idx++;
-      if (this.idx >= n) { this.idx = 0; this.loops++; }
+      if (this.idx >= n) {
+        this.idx = 0; this.loops++;
+        const now = performance.now();
+        slog('循环', {
+          圈: this.loops,
+          平均渲染ms: +(this.renderMs / this.rendered).toFixed(1),
+          实际圈耗时s: +((now - this.loopStart) / 1000).toFixed(2),
+          目标圈耗时s: +(n / fps).toFixed(2)
+        });
+        this.loopStart = now; this.renderMs = 0; this.rendered = 0;
+      }
       updateSendProgress();
     }, Math.round(1000 / fps));
     document.getElementById('btn-send-start').disabled = true;
@@ -12864,6 +12895,12 @@ function initSender() {
 initSender();
 /* ===== 接收端 ===== */
 // __RECEIVER__
+const RECV_LOG = true;
+// 对象参数序列化为 JSON，避免 DevTools「复制全部」时被截断成 {…}
+function rlog(...args) {
+  if (!RECV_LOG) return;
+  console.log('[QR接收]', ...args.map(a => typeof a === 'string' ? a : JSON.stringify(a)));
+}
 const receiver = {
   stream: null,
   timer: null,
@@ -12890,7 +12927,18 @@ const receiver = {
     const track = this.stream.getVideoTracks()[0];
     if ('contentHint' in track) track.contentHint = 'detail';   // 保留细节，避免抓屏为省码率把二维码糊掉
     track.addEventListener('ended', () => this.stopCapture('抓屏已结束'));
+    rlog('环境', {
+      屏幕: window.screen.width + '×' + window.screen.height,
+      窗口: window.innerWidth + '×' + window.innerHeight,
+      DPR: window.devicePixelRatio,
+      CPU线程: navigator.hardwareConcurrency,
+      抓屏设置: track.getSettings ? track.getSettings() : {},
+      抓屏能力: track.getCapabilities ? track.getCapabilities() : {},
+      解码长边上限: DECODE_MAX_DIM,
+      UA: navigator.userAgent
+    });
     this.lastSig = null; this.lastSigOk = false; this.lastAttempt = 0;
+    this.loggedVideo = false; this.failStreak = 0; this.failTotal = 0; this.lastOkAt = 0; this.lastFailLog = 0;
     this.stats = { t0: performance.now(), ticks: 0, changes: 0, attempts: 0, oks: 0, ms: 0 };
     document.getElementById('recv-stats').textContent = '';
     if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
@@ -12912,6 +12960,7 @@ const receiver = {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
     this.stats = null;
+    this.loggedVideo = false;
     document.getElementById('recv-stats').textContent = '';
     document.getElementById('btn-capture').disabled = false;
     if (msg) setRecvStatus(msg);
@@ -12928,27 +12977,50 @@ const receiver = {
   lastSig: null,
   lastSigOk: false,      // 该签名上次是否成功解码
   lastAttempt: 0,
+  loggedVideo: false,
+  failStreak: 0,
+  failTotal: 0,
+  lastOkAt: 0,
+  lastFailLog: 0,
   stats: null,           // 每秒统计：抓屏帧率 / 解码耗时，用于诊断漏帧
   flushStats(now) {
     const st = this.stats;
     if (!st || now - st.t0 < 1000) return;
     const dt = (now - st.t0) / 1000;
+    const avgMs = st.attempts ? st.ms / st.attempts : 0;
+    const size = this.scratch ? this.scratch.width + '×' + this.scratch.height : '—';
+    const total = this.asm.meta ? this.asm.meta.chunks : (this.asm.chunks ? this.asm.chunks.length : 0);
     const el = document.getElementById('recv-stats');
     if (el) {
-      const size = this.scratch ? this.scratch.width + '×' + this.scratch.height : '—';
       el.textContent =
         '抓屏 ' + (st.ticks / dt).toFixed(1) + ' fps' +
         '｜画面变化 ' + (st.changes / dt).toFixed(1) + '/s' +
         '｜解码 ' + (st.attempts / dt).toFixed(1) + '/s（成功 ' + (st.oks / dt).toFixed(1) + '）' +
-        '｜平均 ' + (st.attempts ? (st.ms / st.attempts).toFixed(0) : 0) + ' ms' +
+        '｜平均 ' + Math.round(avgMs) + ' ms' +
         '｜解码尺寸 ' + size +
         (this.asm.badFrames ? '｜坏帧 ' + this.asm.badFrames : '');
     }
+    rlog('统计', {
+      抓屏fps: +(st.ticks / dt).toFixed(1),
+      画面变化每秒: +(st.changes / dt).toFixed(1),
+      解码次数每秒: +(st.attempts / dt).toFixed(1),
+      解码成功每秒: +(st.oks / dt).toFixed(1),
+      平均解码ms: Math.round(avgMs),
+      解码尺寸: size,
+      已收: this.asm.received + '/' + total,
+      坏帧: this.asm.badFrames,
+      解码失败累计: this.failTotal
+    });
     st.t0 = now; st.ticks = 0; st.changes = 0; st.attempts = 0; st.oks = 0; st.ms = 0;
   },
   tick() {
     const video = document.getElementById('capture-video');
     if (video.readyState < 2 || !video.videoWidth) return;
+    if (!this.loggedVideo) {
+      const d = fitDecodeSize(video.videoWidth, video.videoHeight, DECODE_MAX_DIM);
+      rlog('视频就绪', { 捕获尺寸: video.videoWidth + '×' + video.videoHeight, 解码尺寸: d.w + '×' + d.h });
+      this.loggedVideo = true;
+    }
     const st = this.stats;
     const now = performance.now();
     if (st) { st.ticks++; this.flushStats(now); }
@@ -12965,9 +13037,25 @@ const receiver = {
     c.getContext('2d').drawImage(video, 0, 0, w, h);
     const t0 = performance.now();
     const bytes = decodeQRFromCanvas(c);
-    if (st) { st.attempts++; st.ms += performance.now() - t0; if (bytes) st.oks++; }
+    const decodeMs = performance.now() - t0;
+    if (st) { st.attempts++; st.ms += decodeMs; if (bytes) st.oks++; }
     this.lastSigOk = !!bytes;
-    if (!bytes) {
+    if (bytes) {
+      this.failStreak = 0;
+      this.lastOkAt = performance.now();
+    } else {
+      this.failTotal++;
+      if (now - this.lastFailLog >= 1000) {
+        this.lastFailLog = now;
+        rlog('解码失败', {
+          连续失败: this.failStreak + 1,
+          累计失败: this.failTotal,
+          本次耗时ms: Math.round(decodeMs),
+          距上次成功ms: this.lastOkAt ? Math.round(now - this.lastOkAt) : null,
+          解码尺寸: c.width + '×' + c.height
+        });
+      }
+      this.failStreak++;
       // lastSigOk 已置 false：后续帧以 60ms 限速重试（应对切换瞬间的运动模糊/压缩伪影）
       if (!this.asm.meta && !this.done) setRecvStatus('未检测到二维码：请确认发送端在播放且窗口未被遮挡');
       return;
@@ -12980,16 +13068,22 @@ const receiver = {
     const asm = this.asm;
     switch (r.kind) {
       case 'bad':
+        rlog('坏帧（二维码可识别但帧格式错误）', { 累计坏帧: asm.badFrames, 已收: asm.received });
         setRecvStatus(asm.meta
           ? '接收中：' + asm.received + '/' + asm.meta.chunks + ' 片｜坏帧 ' + asm.badFrames
           : '等待头帧…（坏帧 ' + asm.badFrames + '）');
         break;
-      case 'header-repeat':   // 循环播放时每圈重复出现的同 tid 头帧
+      case 'header-repeat': {   // 循环播放时每圈重复出现的同 tid 头帧
+        const miss = listMissingChunks(asm, 50);
+        rlog('头帧重复', { 已收: asm.received + '/' + asm.meta.chunks, 缺失总数: miss.total, 缺失序号: miss.first });
+        break;
+      }
       case 'ignored':
         break;
       case 'header': {
         this.done = false;
         const m = r.meta;
+        rlog('头帧', { 文件: m.name, 大小B: m.size, 分片: m.chunks, 压缩: m.comp, 已预收集: asm.received });
         ensureGrid(m.chunks);
         markChunkGrid(asm);           // 预收集的分片立即标绿
         document.getElementById('recv-progress').value = asm.chunks ? asm.received / m.chunks : 0;
@@ -12997,6 +13091,7 @@ const receiver = {
         break;
       }
       case 'progress': {
+        rlog('数据帧', { seq: r.seq, 新分片: r.isNew, 已收: r.received + '/' + r.total });
         document.getElementById('recv-progress').value = r.received / r.total;
         ensureGrid(r.total);
         markChunkGrid(asm);
@@ -13005,6 +13100,7 @@ const receiver = {
         break;
       }
       case 'awaiting-header': {
+        rlog('分片已齐，等待头帧', { 分片总数: r.total });
         document.getElementById('recv-progress').value = 1;
         ensureGrid(r.total);
         markChunkGrid(asm);
@@ -13017,6 +13113,7 @@ const receiver = {
         markChunkGrid(asm);           // 最后一片随 complete 到达，也要标绿
         document.getElementById('recv-progress').value = 1;
         const m = r.meta;
+        rlog('完成', { 文件: m.name, 大小B: m.size, 分片: m.chunks, 坏帧: asm.badFrames, 解码失败累计: this.failTotal });
         setRecvStatus('完成：' + m.name + '（' + m.size + ' B）✔ SHA-256 校验通过');
         const btn = document.createElement('button');
         btn.textContent = '重新下载 ' + m.name;
@@ -13027,6 +13124,7 @@ const receiver = {
         break;
       }
       case 'hash-error':
+        rlog('SHA-256 校验失败', { 文件: r.meta && r.meta.name, 已收: asm.received + '/' + (r.meta ? r.meta.chunks : '?') });
         setRecvStatus('错误：SHA-256 校验不符。请让发送端重新发送，或降低帧率/分片后重试（本端继续接收中）。');
         break;
     }
@@ -13039,6 +13137,20 @@ function shouldDecodeFrame(sig, lastSig, lastSigOk, now, lastAttempt, retryMs) {
   if (sig !== lastSig) return true;
   if (lastSigOk) return false;
   return now - lastAttempt >= retryMs;
+}
+// 缺失分片序号：total 为缺失总数，first 最多取 limit 个（日志用）
+function listMissingChunks(asm, limit) {
+  const first = [];
+  let total = 0;
+  if (asm.chunks) {
+    for (let i = 0; i < asm.chunks.length; i++) {
+      if (asm.chunks[i] === null) {
+        total++;
+        if (first.length < limit) first.push(i);
+      }
+    }
+  }
+  return { total, first };
 }
 // 帧签名：把画面缩到 64×36 后采样哈希，用于「画面未变则跳过解码」
 function frameSignatureOf(source) {
@@ -13285,6 +13397,12 @@ test('多片随机数据走 H/D 帧，乱序+重复也能收齐', async () => {
   let r = await asm.feed(t.frames[1]);
   assertEq(r.kind, 'progress');
   assertEq(asm.received, 1, '无头帧也应预收集');
+  assertEq(r.seq, 0, '进度应携带分片序号');
+  assertEq(r.isNew, true, '首次收到应为新分片');
+  const dup = await asm.feed(t.frames[1]);
+  assertEq(dup.kind, 'progress');
+  assertEq(dup.isNew, false, '重复分片标记为非新');
+  assertEq(asm.received, 1, '重复分片不应增加计数');
   r = await asm.feed(t.frames[0]);
   assertEq(r.kind, 'header');
   let completed = null;
@@ -13328,6 +13446,18 @@ test('分片数超 65535 拒绝', async () => {
   try { await prepareTransfer('big.bin', crypto.getRandomValues(new Uint8Array(70000)), 1); }
   catch (e) { threw = true; }
   assert(threw, '应抛异常');
+});
+test('缺失分片统计（日志用）', () => {
+  const asm = new Assembler();
+  asm.chunks = [1, null, null, 2, null];
+  asm.meta = { chunks: 5 };
+  let r = listMissingChunks(asm, 10);
+  assertEq(r.total, 3); assertEq(r.first.join(','), '1,2,4');
+  r = listMissingChunks(asm, 2);
+  assertEq(r.total, 3); assertEq(r.first.length, 2);
+  asm.chunks = null;
+  r = listMissingChunks(asm, 10);
+  assertEq(r.total, 0); assertEq(r.first.length, 0);
 });
 test('头帧编解码回环（UTF-8 文件名）', () => {
   const meta = { name: '报告 2026.txt', size: 123, csize: 100, comp: 'gzip', chunks: 3, sha256: 'ab'.repeat(32) };
