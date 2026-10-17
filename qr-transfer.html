@@ -12411,15 +12411,16 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 </script>
 <style>
 body { font-family: system-ui, "Microsoft YaHei", sans-serif; margin: 0; background: #f5f5f5; color: #222; }
-header { display: flex; align-items: baseline; gap: 16px; padding: 10px 20px; background: #222; color: #fff; }
-header h1 { font-size: 18px; margin: 0; }
-nav a { color: #9cf; margin-right: 12px; text-decoration: none; }
-main { padding: 20px; max-width: 900px; margin: 0 auto; }
-#qr-canvas { background: #fff; display: block; margin: 16px auto; box-shadow: 0 0 0 1px #ccc; }
-#drop-zone { border: 2px dashed #999; padding: 24px; text-align: center; border-radius: 8px; background: #fff; }
+header { display: flex; align-items: baseline; gap: 12px; padding: 5px 14px; background: #222; color: #fff; }
+header h1 { font-size: 15px; margin: 0; }
+nav a { color: #9cf; margin-right: 12px; text-decoration: none; font-size: 13px; }
+main { padding: 8px; max-width: 1100px; margin: 0 auto; }
+#qr-canvas { background: #fff; display: block; margin: 6px auto; box-shadow: 0 0 0 1px #ccc; }
+#drop-zone { border: 2px dashed #999; padding: 4px 10px; text-align: center; border-radius: 6px; background: #fff; font-size: 13px; }
 #drop-zone.drag { border-color: #06c; background: #eef6ff; }
-.status { margin-top: 12px; font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; }
-.controls { margin: 12px 0; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.status { margin-top: 4px; font-family: ui-monospace, Consolas, monospace; white-space: pre-wrap; font-size: 12px; }
+.controls { margin: 6px 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+#send-prep { width: 100%; height: 8px; margin: 2px 0; }
 #chunk-grid { margin-top: 8px; line-height: 0; }
 #chunk-grid i { display: inline-block; width: 10px; height: 10px; margin: 1px; background: #ccc; }
 #chunk-grid i.got { background: #2a2; }
@@ -12462,6 +12463,7 @@ video { max-width: 320px; background: #000; }
       <button id="btn-send-start" disabled>开始</button>
       <button id="btn-send-pause" disabled>暂停</button>
     </div>
+    <progress id="send-prep" max="100" value="0" style="display:none"></progress>
     <canvas id="qr-canvas"></canvas>
     <div id="send-status" class="status">未选择文件</div>
   </section>
@@ -12581,22 +12583,30 @@ async function sha256Hex(data) {
 }
 
 // 返回 { meta, tid, frames: Uint8Array[] }；frames[0] 为 H 帧（或唯一 A 帧）
-async function prepareTransfer(name, fileData, chunkSize) {
+async function prepareTransfer(name, fileData, chunkSize, onProgress) {
+  const progress = (pct, msg) => { if (onProgress) onProgress(pct, msg); };
+  progress(20, '计算 SHA-256…');
   const sha256 = await sha256Hex(fileData);
+  progress(45, 'gzip 压缩…');
   const gz = await compressGzip(fileData);
   const comp = gz.length < fileData.length ? 'gzip' : 'none';
   const data = comp === 'gzip' ? gz : fileData;
   const tid = Math.floor(Math.random() * 256);
   const base = { name, size: fileData.length, csize: data.length, comp, sha256 };
-  const aFrame = encodeAllInOneFrame({ ...base, chunks: 1 }, data, tid);
-  if (aFrame.length <= ALL_IN_ONE_MAX) {
-    return { meta: { ...base, chunks: 1 }, tid, frames: [aFrame] };
+  progress(70, '组帧…');
+  // 精确预判整帧长度（4 字节头 + 头 JSON + 数据），避免大文件白做一次 A 帧编码
+  const headJson = te.encode(JSON.stringify({ ...base, chunks: 1 }));
+  if (4 + headJson.length + data.length <= ALL_IN_ONE_MAX) {
+    progress(100, '完成');
+    const meta = { ...base, chunks: 1 };
+    return { meta, tid, frames: [encodeAllInOneFrame(meta, data, tid)] };
   }
   const chunks = sliceChunks(data, chunkSize);
   if (chunks.length > MAX_CHUNKS) throw new Error('文件过大：分片数超过 ' + MAX_CHUNKS);
   const meta = { ...base, chunks: chunks.length };
   const frames = [encodeHeaderFrame(meta, tid)];
   for (let i = 0; i < chunks.length; i++) frames.push(encodeDataFrame(i, chunks[i], tid));
+  progress(100, '完成');
   return { meta, tid, frames };
 }
 
@@ -12673,23 +12683,17 @@ function bytesToLatin1(bytes) {
   }
   return s;
 }
-function buildQrModel(frame) {
-  const qr = qrcode(0, 'M');        // 0 = 版本号自动，M = 纠错 15%
+function buildQrModel(frame, version) {
+  const qr = qrcode(version || 0, 'M');   // version 省略/0 = 版本号自动，M = 纠错 15%
   qr.addData(bytesToLatin1(frame), 'Byte');
   qr.make();
   return qr;
 }
-// 统一版本：以最大帧确定版本，保证一次传输所有帧的 QR 尺寸一致（抓屏解码更稳定）
-function buildQrModels(frames) {
+// 以最大帧确定统一版本：一次传输所有帧 QR 尺寸一致，且无需预构建全部模型
+function pickQrVersion(frames) {
   let maxFrame = frames[0];
   for (const f of frames) if (f.length > maxFrame.length) maxFrame = f;
-  const version = (buildQrModel(maxFrame).getModuleCount() - 17) / 4;
-  return frames.map(f => {
-    const qr = qrcode(version, 'M');
-    qr.addData(bytesToLatin1(f), 'Byte');
-    qr.make();
-    return qr;
-  });
+  return (buildQrModel(maxFrame).getModuleCount() - 17) / 4;
 }
 function drawQrModel(qr, canvas, maxPx) {
   const count = qr.getModuleCount();
@@ -12721,7 +12725,7 @@ function decodeQRFromCanvas(canvas) {
 // __SENDER__
 const sender = {
   transfer: null,      // { meta, tid, frames }
-  qrModels: null,
+  qrVersion: 0,        // 统一 QR 版本（由 pickQrVersion 探测）
   timer: null,
   idx: 0,
   loops: 0,
@@ -12729,18 +12733,27 @@ const sender = {
     this.pause();
     // 入口同步禁用「开始」：prepareTransfer 耗时期间防止以旧 transfer 启动定时器
     document.getElementById('btn-send-start').disabled = true;
+    const prep = document.getElementById('send-prep');
+    prep.style.display = ''; prep.value = 5;
+    setSendStatus('准备中：读取文件…');
+    await nextFrame();   // 让进度条先绘制，再进重活
     const chunkSize = +document.getElementById('opt-chunk').value;
     const data = new Uint8Array(await file.arrayBuffer());
     try {
-      this.transfer = await prepareTransfer(file.name, data, chunkSize);
+      this.transfer = await prepareTransfer(file.name, data, chunkSize, (pct, msg) => {
+        prep.value = pct;
+        setSendStatus('准备中：' + msg);
+      });
     } catch (e) {
+      prep.style.display = 'none';
       setSendStatus('错误：' + e.message);
       return;
     }
     // 窗口期内可能已被点击启动定时器，再次 pause 清除（成功路径末尾会重新启用按钮）
     this.pause();
-    this.qrModels = buildQrModels(this.transfer.frames);
+    this.qrVersion = pickQrVersion(this.transfer.frames);
     this.idx = 0; this.loops = 0;
+    prep.value = 100; prep.style.display = 'none';
     const m = this.transfer.meta;
     setSendStatus(
       '文件：' + m.name + '（' + m.size + ' B' +
@@ -12751,16 +12764,16 @@ const sender = {
     );
     document.getElementById('btn-send-start').disabled = false;
     // 未开始播放时先静态显示首帧，便于确认窗口
-    drawQrModel(this.qrModels[0], document.getElementById('qr-canvas'), qrMaxPx());
+    drawQrModel(buildQrModel(this.transfer.frames[0], this.qrVersion), document.getElementById('qr-canvas'), qrMaxPx());
   },
   start() {
     if (!this.transfer || this.timer) return;
-    if (!this.qrModels) this.qrModels = buildQrModels(this.transfer.frames);
     const fps = +document.getElementById('opt-fps').value;
     const n = this.transfer.frames.length;
     const canvas = document.getElementById('qr-canvas');
     this.timer = setInterval(() => {
-      drawQrModel(this.qrModels[this.idx], canvas, qrMaxPx());
+      // 按需构建当前帧：不预建全量模型（大文件几千帧会冻结 UI 并耗费数 GB 内存）
+      drawQrModel(buildQrModel(this.transfer.frames[this.idx], this.qrVersion), canvas, qrMaxPx());
       this.idx++;
       if (this.idx >= n) { this.idx = 0; this.loops++; }
       updateSendProgress();
@@ -12774,10 +12787,12 @@ const sender = {
     if (this.transfer) document.getElementById('btn-send-start').disabled = false;
   },
 };
+function nextFrame() { return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); }
 function qrMaxPx() {
   const v = document.getElementById('opt-size').value;
   if (v !== 'auto') return +v;
-  return Math.max(200, Math.min(window.innerWidth, window.innerHeight) - 80);
+  // 自适应：扣除头部/控件/拖放区/状态栏后的可用面积
+  return Math.max(200, Math.min(window.innerWidth - 32, window.innerHeight - 180));
 }
 function setSendStatus(s) { document.getElementById('send-status').textContent = s; }
 function updateSendProgress() {
@@ -12806,8 +12821,8 @@ function initSender() {
   });
   document.getElementById('opt-size').addEventListener('change', () => {
     // 暂停中换尺寸：立即重绘当前帧；播放中下一帧自动生效
-    if (!sender.timer && sender.qrModels) {
-      drawQrModel(sender.qrModels[sender.idx], document.getElementById('qr-canvas'), qrMaxPx());
+    if (!sender.timer && sender.transfer) {
+      drawQrModel(buildQrModel(sender.transfer.frames[sender.idx], sender.qrVersion), document.getElementById('qr-canvas'), qrMaxPx());
     }
   });
 }
@@ -12955,14 +12970,33 @@ test('同一次传输所有帧 QR 版本统一（尺寸一致）', async () => {
   const data = crypto.getRandomValues(new Uint8Array(1200));
   const t = await prepareTransfer('size.bin', data, 600);
   assert(t.frames.length > 2, '应含头帧 + 多片数据帧');
-  const models = buildQrModels(t.frames);
-  const counts = models.map(m => m.getModuleCount());
+  const v = pickQrVersion(t.frames);
+  const counts = t.frames.map(f => buildQrModel(f, v).getModuleCount());
   for (const c of counts) assertEq(c, counts[0], '所有帧模块数应一致');
-  for (let i = 0; i < models.length; i++) {
+  for (let i = 0; i < t.frames.length; i++) {
     const canvas = document.createElement('canvas');
-    drawQrModel(models[i], canvas, 600);
+    drawQrModel(buildQrModel(t.frames[i], v), canvas, 600);
     assertBytesEq(decodeQRFromCanvas(canvas), t.frames[i], '帧 ' + i);
   }
+});
+test('prepareTransfer 进度回调递增且最终到 100', async () => {
+  const pcts = [];
+  await prepareTransfer('p.bin', crypto.getRandomValues(new Uint8Array(1000)), 600, pct => pcts.push(pct));
+  assert(pcts.length >= 2, '应有多个进度回调，实际 ' + pcts.length);
+  assertEq(pcts[pcts.length - 1], 100, '最终进度应为 100');
+  for (let i = 1; i < pcts.length; i++) assert(pcts[i] >= pcts[i - 1], '进度应递增');
+});
+test('头 JSON 把整帧顶过阈值时走 H/D 路径', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(300));
+  const longName = '长'.repeat(100) + '.bin';   // UTF-8 文件名把头 JSON 顶到 ~400B
+  const t = await prepareTransfer(longName, data, 600);
+  assertEq(t.frames.length, 2, '应为 H + D0 两帧');
+  assertEq(t.meta.chunks, 1);
+  const asm = new Assembler();
+  await asm.feed(t.frames[0]);
+  const r = await asm.feed(t.frames[1]);
+  assertEq(r.kind, 'complete');
+  assertBytesEq(r.data, data);
 });
 test('接收完成时所有分片格（含最后一格）变绿', async () => {
   const data = crypto.getRandomValues(new Uint8Array(800));
