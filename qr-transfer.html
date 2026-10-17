@@ -12682,7 +12682,86 @@ function decodeQRFromCanvas(canvas) {
   return res ? new Uint8Array(res.binaryData) : null;
 }
 /* ===== 发送端 ===== */
-// __SENDER__
+const sender = {
+  transfer: null,      // { meta, tid, frames }
+  qrModels: null,
+  timer: null,
+  idx: 0,
+  loops: 0,
+  async setFile(file) {
+    this.pause();
+    const chunkSize = +document.getElementById('opt-chunk').value;
+    const data = new Uint8Array(await file.arrayBuffer());
+    try {
+      this.transfer = await prepareTransfer(file.name, data, chunkSize);
+    } catch (e) {
+      setSendStatus('错误：' + e.message);
+      return;
+    }
+    this.qrModels = null; this.idx = 0; this.loops = 0;
+    const m = this.transfer.meta;
+    setSendStatus(
+      '文件：' + m.name + '（' + m.size + ' B' +
+      (m.comp === 'gzip' ? '，gzip 后 ' + m.csize + ' B' : '，不可压缩') + '）\n' +
+      (this.transfer.frames.length === 1
+        ? '整包帧：单张静态二维码'
+        : '共 ' + m.chunks + ' 片（' + (this.transfer.frames.length) + ' 帧/圈）')
+    );
+    document.getElementById('btn-send-start').disabled = false;
+    // 未开始播放时先静态显示首帧，便于确认窗口
+    renderFrameToCanvas(this.transfer.frames[0], document.getElementById('qr-canvas'), qrMaxPx());
+  },
+  start() {
+    if (!this.transfer || this.timer) return;
+    if (!this.qrModels) this.qrModels = this.transfer.frames.map(buildQrModel);
+    const fps = +document.getElementById('opt-fps').value;
+    const n = this.transfer.frames.length;
+    const canvas = document.getElementById('qr-canvas');
+    this.timer = setInterval(() => {
+      drawQrModel(this.qrModels[this.idx], canvas, qrMaxPx());
+      this.idx++;
+      if (this.idx >= n) { this.idx = 0; this.loops++; }
+      updateSendProgress();
+    }, Math.round(1000 / fps));
+    document.getElementById('btn-send-start').disabled = true;
+    document.getElementById('btn-send-pause').disabled = false;
+  },
+  pause() {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    document.getElementById('btn-send-pause').disabled = true;
+    if (this.transfer) document.getElementById('btn-send-start').disabled = false;
+  },
+};
+function qrMaxPx() {
+  return Math.max(200, Math.min(window.innerWidth, window.innerHeight) - 80);
+}
+function setSendStatus(s) { document.getElementById('send-status').textContent = s; }
+function updateSendProgress() {
+  const n = sender.transfer.frames.length;
+  const fps = +document.getElementById('opt-fps').value;
+  const label = n === 1 ? '静态帧' : (sender.idx === 0 ? '头帧' : '数据帧 ' + sender.idx + '/' + (n - 1));
+  setSendStatus(
+    '播放中：' + label + '｜' + fps + ' fps｜已循环 ' + sender.loops + ' 圈｜每圈约 ' + (n / fps).toFixed(1) + ' s'
+  );
+}
+function initSender() {
+  const dz = document.getElementById('drop-zone');
+  const fi = document.getElementById('file-input');
+  fi.addEventListener('change', () => fi.files[0] && sender.setFile(fi.files[0]));
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('drag');
+    if (e.dataTransfer.files[0]) sender.setFile(e.dataTransfer.files[0]);
+  });
+  document.getElementById('btn-send-start').addEventListener('click', () => sender.start());
+  document.getElementById('btn-send-pause').addEventListener('click', () => sender.pause());
+  document.getElementById('opt-fps').addEventListener('input', e => {
+    document.getElementById('opt-fps-val').textContent = e.target.value;
+    if (sender.timer) { sender.pause(); sender.start(); }   // 播放中调速即时生效
+  });
+}
+initSender();
 /* ===== 接收端 ===== */
 // __RECEIVER__
 /* ===== 路由 ===== */
