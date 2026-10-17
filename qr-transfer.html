@@ -12879,7 +12879,18 @@ const receiver = {
     const video = document.getElementById('capture-video');
     video.srcObject = this.stream;
     this.stream.getVideoTracks()[0].addEventListener('ended', () => this.stopCapture('抓屏已结束'));
-    this.timer = setInterval(() => this.tick(), 150);
+    this.lastSig = null;
+    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+      // 跟随视频帧率解码（高达 ~30 次/s）；画面未变时 tick 内部跳过
+      const step = () => {
+        if (!this.stream) return;
+        this.tick();
+        video.requestVideoFrameCallback(step);
+      };
+      video.requestVideoFrameCallback(step);
+    } else {
+      this.timer = setInterval(() => this.tick(), 150);   // 不支持 rVFC 的回退
+    }
     document.getElementById('btn-capture').disabled = true;
     document.getElementById('btn-recv-reset').disabled = false;
     setRecvStatus('解码中：等待头帧…（请确认发送端在播放且窗口未被遮挡）');
@@ -12891,16 +12902,20 @@ const receiver = {
     if (msg) setRecvStatus(msg);
   },
   reset() {
-    this.asm.reset(); this.done = false;
+    this.asm.reset(); this.done = false; this.lastSig = null;
     document.getElementById('chunk-grid').innerHTML = '';
     document.getElementById('recv-result').innerHTML = '';
     document.getElementById('recv-progress').value = 0;
-    setRecvStatus(this.timer ? '解码中：等待头帧…' : '等待抓屏');
+    setRecvStatus(this.stream ? '解码中：等待头帧…' : '等待抓屏');
   },
   scratch: null,
+  lastSig: null,
   tick() {
     const video = document.getElementById('capture-video');
     if (video.readyState < 2 || !video.videoWidth) return;
+    const sig = frameSignatureOf(video);
+    if (sig === this.lastSig) return;    // 画面未变：跳过本轮解码
+    this.lastSig = sig;
     if (!this.scratch) this.scratch = document.createElement('canvas');
     const c = this.scratch;
     c.width = video.videoWidth; c.height = video.videoHeight;
@@ -12971,6 +12986,21 @@ const receiver = {
   },
 };
 function setRecvStatus(s) { document.getElementById('recv-status').textContent = s; }
+// 帧签名：把画面缩到 64×36 后采样哈希，用于「画面未变则跳过解码」
+function frameSignatureOf(source) {
+  if (!frameSignatureOf.canvas) frameSignatureOf.canvas = document.createElement('canvas');
+  const c = frameSignatureOf.canvas;
+  c.width = 64; c.height = 36;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(source, 0, 0, 64, 36);
+  const d = ctx.getImageData(0, 0, 64, 36).data;
+  let h1 = 0, h2 = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    h1 = (h1 * 31 + d[i]) | 0;
+    h2 = (h2 * 31 + d[i + 1] + d[i + 2]) | 0;
+  }
+  return h1 + ':' + h2;
+}
 function ensureGrid(n) {
   const grid = document.getElementById('chunk-grid');
   if (grid.children.length !== n) {
@@ -13008,6 +13038,18 @@ function route() {
 window.addEventListener('hashchange', route);
 /* ===== 测试用例 ===== */
 // __TESTS__
+test('帧签名：相同画面一致、不同画面不同', () => {
+  const mk = color => {
+    const c = document.createElement('canvas');
+    c.width = 32; c.height = 32;
+    const x = c.getContext('2d');
+    x.fillStyle = color; x.fillRect(0, 0, 32, 32);
+    return c;
+  };
+  const a1 = mk('#fff'), a2 = mk('#fff'), b = mk('#000');
+  assertEq(frameSignatureOf(a1), frameSignatureOf(a2), '相同画面签名应一致');
+  assert(frameSignatureOf(a1) !== frameSignatureOf(b), '不同画面签名应不同');
+});
 test('同一次传输所有帧 QR 版本统一（尺寸一致）', async () => {
   const data = crypto.getRandomValues(new Uint8Array(1200));
   const t = await prepareTransfer('size.bin', data, 600);
