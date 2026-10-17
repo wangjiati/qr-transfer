@@ -12474,6 +12474,7 @@ video { max-width: 320px; background: #000; }
     </div>
     <video id="capture-video" autoplay muted playsinline></video>
     <div id="recv-status" class="status">等待抓屏</div>
+    <div id="recv-stats" class="note"></div>
     <progress id="recv-progress" value="0" max="1" style="width:100%"></progress>
     <div id="chunk-grid"></div>
     <div id="recv-result"></div>
@@ -12745,8 +12746,15 @@ function renderFrameToCanvas(frame, canvas, maxPx) {
 function decodeQRFromCanvas(canvas) {
   const ctx = canvas.getContext('2d');
   const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const res = jsQR(img.data, img.width, img.height);
+  // 发送端始终是黑码白底，不必尝试反色，省掉一半扫描
+  const res = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
   return res ? new Uint8Array(res.binaryData) : null;
+}
+const DECODE_MAX_DIM = 1600;   // 解码画布长边上限：抓屏越大 jsQR 越慢，等比缩小才能跟上高帧率
+// 按长边上限等比缩放抓屏尺寸
+function fitDecodeSize(vw, vh, maxDim) {
+  const scale = Math.min(1, maxDim / Math.max(vw, vh));
+  return { w: Math.max(1, Math.round(vw * scale)), h: Math.max(1, Math.round(vh * scale)) };
 }
 /* ===== 发送端 ===== */
 // __SENDER__
@@ -12870,7 +12878,8 @@ const receiver = {
       return;
     }
     try {
-      this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      // 请求较高抓屏帧率：默认抓屏可能只有 ~5fps，与发送帧率接近时会系统性漏帧
+      this.stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } } });
     } catch (e) {
       document.getElementById('btn-capture').disabled = false;
       setRecvStatus('抓屏被拒绝：' + e.message + '\n提示：需 file://、localhost 或 https 环境。');
@@ -12878,8 +12887,12 @@ const receiver = {
     }
     const video = document.getElementById('capture-video');
     video.srcObject = this.stream;
-    this.stream.getVideoTracks()[0].addEventListener('ended', () => this.stopCapture('抓屏已结束'));
+    const track = this.stream.getVideoTracks()[0];
+    if ('contentHint' in track) track.contentHint = 'detail';   // 保留细节，避免抓屏为省码率把二维码糊掉
+    track.addEventListener('ended', () => this.stopCapture('抓屏已结束'));
     this.lastSig = null; this.lastSigOk = false; this.lastAttempt = 0;
+    this.stats = { t0: performance.now(), ticks: 0, changes: 0, attempts: 0, oks: 0, ms: 0 };
+    document.getElementById('recv-stats').textContent = '';
     if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
       // 跟随视频帧率解码（高达 ~30 次/s）；画面未变时 tick 内部跳过
       const step = () => {
@@ -12898,6 +12911,8 @@ const receiver = {
   stopCapture(msg) {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
+    this.stats = null;
+    document.getElementById('recv-stats').textContent = '';
     document.getElementById('btn-capture').disabled = false;
     if (msg) setRecvStatus(msg);
   },
@@ -12913,19 +12928,44 @@ const receiver = {
   lastSig: null,
   lastSigOk: false,      // 该签名上次是否成功解码
   lastAttempt: 0,
+  stats: null,           // 每秒统计：抓屏帧率 / 解码耗时，用于诊断漏帧
+  flushStats(now) {
+    const st = this.stats;
+    if (!st || now - st.t0 < 1000) return;
+    const dt = (now - st.t0) / 1000;
+    const el = document.getElementById('recv-stats');
+    if (el) {
+      const size = this.scratch ? this.scratch.width + '×' + this.scratch.height : '—';
+      el.textContent =
+        '抓屏 ' + (st.ticks / dt).toFixed(1) + ' fps' +
+        '｜画面变化 ' + (st.changes / dt).toFixed(1) + '/s' +
+        '｜解码 ' + (st.attempts / dt).toFixed(1) + '/s（成功 ' + (st.oks / dt).toFixed(1) + '）' +
+        '｜平均 ' + (st.attempts ? (st.ms / st.attempts).toFixed(0) : 0) + ' ms' +
+        '｜解码尺寸 ' + size +
+        (this.asm.badFrames ? '｜坏帧 ' + this.asm.badFrames : '');
+    }
+    st.t0 = now; st.ticks = 0; st.changes = 0; st.attempts = 0; st.oks = 0; st.ms = 0;
+  },
   tick() {
     const video = document.getElementById('capture-video');
     if (video.readyState < 2 || !video.videoWidth) return;
-    const sig = frameSignatureOf(video);
+    const st = this.stats;
     const now = performance.now();
+    if (st) { st.ticks++; this.flushStats(now); }
+    const sig = frameSignatureOf(video);
+    if (st && sig !== this.lastSig) st.changes++;
     if (!shouldDecodeFrame(sig, this.lastSig, this.lastSigOk, now, this.lastAttempt, SAME_FRAME_RETRY_MS)) return;
     this.lastSig = sig;
     this.lastAttempt = now;
     if (!this.scratch) this.scratch = document.createElement('canvas');
     const c = this.scratch;
-    c.width = video.videoWidth; c.height = video.videoHeight;
-    c.getContext('2d').drawImage(video, 0, 0);
+    // 等比缩小后再解码：全分辨率（尤其 2K/4K 抓屏）单帧 jsQR 可能耗时 100ms+，会卡住逐帧解码
+    const { w, h } = fitDecodeSize(video.videoWidth, video.videoHeight, DECODE_MAX_DIM);
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    c.getContext('2d').drawImage(video, 0, 0, w, h);
+    const t0 = performance.now();
     const bytes = decodeQRFromCanvas(c);
+    if (st) { st.attempts++; st.ms += performance.now() - t0; if (bytes) st.oks++; }
     this.lastSigOk = !!bytes;
     if (!bytes) {
       // lastSigOk 已置 false：后续帧以 60ms 限速重试（应对切换瞬间的运动模糊/压缩伪影）
@@ -13059,6 +13099,35 @@ test('同帧解码失败应限速重试，成功后才跳过', () => {
   assertEq(shouldDecodeFrame('A', 'A', false, 60, 0, R), true, '失败后超过间隔应重试');
   assertEq(shouldDecodeFrame('A', 'A', true, 10000, 0, R), false, '已成功解出的同帧不重试');
   assertEq(shouldDecodeFrame('B', 'A', true, 10, 0, R), true, '新画面即使上次成功也解码');
+});
+test('解码画布尺寸：长边按上限等比缩小，未超限保持原尺寸', () => {
+  let s = fitDecodeSize(1920, 1080, 1600);
+  assertEq(s.w, 1600); assertEq(s.h, 900);
+  s = fitDecodeSize(3840, 2160, 1600);
+  assertEq(s.w, 1600); assertEq(s.h, 900);
+  s = fitDecodeSize(1080, 1920, 1600);
+  assertEq(s.w, 900); assertEq(s.h, 1600);
+  s = fitDecodeSize(1280, 720, 1600);
+  assertEq(s.w, 1280); assertEq(s.h, 720);
+  s = fitDecodeSize(1000, 750, 640);
+  assertEq(s.w, 640); assertEq(s.h, 480);
+});
+test('2K 抓屏下采样后仍能解码出分片帧', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(1200));
+  const t = await prepareTransfer('down.bin', data, 600);
+  const v = pickQrVersion(t.frames);
+  const qrCanvas = document.createElement('canvas');
+  drawQrModel(buildQrModel(t.frames[1], v), qrCanvas, 900);
+  const screen = document.createElement('canvas');
+  screen.width = 2560; screen.height = 1440;
+  const ctx = screen.getContext('2d');
+  ctx.fillStyle = '#eef'; ctx.fillRect(0, 0, 2560, 1440);
+  ctx.drawImage(qrCanvas, 800, 100);
+  const { w, h } = fitDecodeSize(2560, 1440, DECODE_MAX_DIM);
+  const down = document.createElement('canvas');
+  down.width = w; down.height = h;
+  down.getContext('2d').drawImage(screen, 0, 0, w, h);
+  assertBytesEq(decodeQRFromCanvas(down), t.frames[1]);
 });
 test('帧签名：相同画面一致、不同画面不同', () => {
   const mk = color => {
