@@ -12424,6 +12424,8 @@ main { padding: 8px; max-width: 1100px; margin: 0 auto; }
 #chunk-grid { margin-top: 8px; line-height: 0; }
 #chunk-grid i { display: inline-block; width: 10px; height: 10px; margin: 1px; background: #ccc; }
 #chunk-grid i.got { background: #2a2; }
+#tx-beacon { position: fixed; left: 0; bottom: 0; width: 6px; height: 6px; background: #000; opacity: 0; pointer-events: none; animation: tx-beacon .5s linear infinite alternate; z-index: 9999; }
+@keyframes tx-beacon { from { opacity: 0 } to { opacity: 1 } }
 .pass { color: #080; } .fail { color: #c00; }
 video { max-width: 320px; background: #000; }
 .note { color: #666; font-size: 13px; }
@@ -12446,6 +12448,8 @@ video { max-width: 320px; background: #000; }
     <p class="note">接收端必须以 file:// 双击、localhost 或 https 方式打开；内网 http://裸IP 访问时浏览器会禁止抓屏。</p>
   </section>
   <section id="view-send" style="display:none">
+    <!-- 保活标记：持续制造画面变化，逼使窗口抓屏持续出帧；接收端帧签名忽略边角 -->
+    <span id="tx-beacon"></span>
     <div class="controls">
       <span id="drop-zone">拖放文件到这里，或 <input type="file" id="file-input" style="max-width:210px; font-size:12px"></span>
       <label>帧率 <input type="range" id="opt-fps" min="2" max="5" value="5" style="width:70px; vertical-align:middle"> <b id="opt-fps-val">5</b> fps</label>
@@ -12939,19 +12943,20 @@ const receiver = {
     });
     this.lastSig = null; this.lastSigOk = false; this.lastAttempt = 0;
     this.loggedVideo = false; this.failStreak = 0; this.failTotal = 0; this.lastOkAt = 0; this.lastFailLog = 0;
-    this.stats = { t0: performance.now(), ticks: 0, changes: 0, attempts: 0, oks: 0, ms: 0 };
+    this.stats = { t0: performance.now(), ticks: 0, rvfc: 0, changes: 0, attempts: 0, oks: 0, ms: 0 };
     document.getElementById('recv-stats').textContent = '';
-    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    this.hasRvfc = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+    if (this.hasRvfc) {
       // 跟随视频帧率解码（高达 ~30 次/s）；画面未变时 tick 内部跳过
       const step = () => {
         if (!this.stream) return;
-        this.tick();
+        this.tick('rvfc');
         video.requestVideoFrameCallback(step);
       };
       video.requestVideoFrameCallback(step);
-    } else {
-      this.timer = setInterval(() => this.tick(), 150);   // 不支持 rVFC 的回退
     }
+    // 始终保留定时轮询：窗口被遮挡/页面不可见时 rVFC 可能不触发，video 仍有最新帧
+    this.timer = setInterval(() => this.tick('timer'), 150);
     document.getElementById('btn-capture').disabled = true;
     document.getElementById('btn-recv-reset').disabled = false;
     setRecvStatus('解码中：等待头帧…（请确认发送端在播放且窗口未被遮挡）');
@@ -12993,7 +12998,7 @@ const receiver = {
     const el = document.getElementById('recv-stats');
     if (el) {
       el.textContent =
-        '抓屏 ' + (st.ticks / dt).toFixed(1) + ' fps' +
+        '抓屏 ' + (st.rvfc / dt).toFixed(1) + '/s（轮询 ' + ((st.ticks - st.rvfc) / dt).toFixed(1) + '/s）' +
         '｜画面变化 ' + (st.changes / dt).toFixed(1) + '/s' +
         '｜解码 ' + (st.attempts / dt).toFixed(1) + '/s（成功 ' + (st.oks / dt).toFixed(1) + '）' +
         '｜平均 ' + Math.round(avgMs) + ' ms' +
@@ -13001,7 +13006,8 @@ const receiver = {
         (this.asm.badFrames ? '｜坏帧 ' + this.asm.badFrames : '');
     }
     rlog('统计', {
-      抓屏fps: +(st.ticks / dt).toFixed(1),
+      抓屏rvfc每秒: +(st.rvfc / dt).toFixed(1),
+      轮询每秒: +((st.ticks - st.rvfc) / dt).toFixed(1),
       画面变化每秒: +(st.changes / dt).toFixed(1),
       解码次数每秒: +(st.attempts / dt).toFixed(1),
       解码成功每秒: +(st.oks / dt).toFixed(1),
@@ -13011,9 +13017,12 @@ const receiver = {
       坏帧: this.asm.badFrames,
       解码失败累计: this.failTotal
     });
-    st.t0 = now; st.ticks = 0; st.changes = 0; st.attempts = 0; st.oks = 0; st.ms = 0;
+    if (this.hasRvfc && st.rvfc === 0) {
+      rlog('警告：本轮 rVFC 无新帧', { 提示: '被捕获窗口可能被遮挡、最小化或抓屏已暂停' });
+    }
+    st.t0 = now; st.ticks = 0; st.rvfc = 0; st.changes = 0; st.attempts = 0; st.oks = 0; st.ms = 0;
   },
-  tick() {
+  tick(source) {
     const video = document.getElementById('capture-video');
     if (video.readyState < 2 || !video.videoWidth) return;
     if (!this.loggedVideo) {
@@ -13023,10 +13032,10 @@ const receiver = {
     }
     const st = this.stats;
     const now = performance.now();
-    if (st) { st.ticks++; this.flushStats(now); }
+    if (st) { st.ticks++; if (source === 'rvfc') st.rvfc++; this.flushStats(now); }
     const sig = frameSignatureOf(video);
     if (st && sig !== this.lastSig) st.changes++;
-    if (!shouldDecodeFrame(sig, this.lastSig, this.lastSigOk, now, this.lastAttempt, SAME_FRAME_RETRY_MS)) return;
+    if (!shouldDecodeFrame(sig, this.lastSig, this.lastSigOk, now, this.lastAttempt, SAME_FRAME_RETRY_MS, MIN_DECODE_INTERVAL_MS)) return;
     this.lastSig = sig;
     this.lastAttempt = now;
     if (!this.scratch) this.scratch = document.createElement('canvas');
@@ -13132,9 +13141,10 @@ const receiver = {
 };
 function setRecvStatus(s) { document.getElementById('recv-status').textContent = s; }
 const SAME_FRAME_RETRY_MS = 60;   // 同一画面解码失败后的最小重试间隔
-// 是否本轮解码：新画面必解；同一画面解出过则跳过；失败过则限速重试
-function shouldDecodeFrame(sig, lastSig, lastSigOk, now, lastAttempt, retryMs) {
-  if (sig !== lastSig) return true;
+const MIN_DECODE_INTERVAL_MS = 80; // 新画面解码最小间隔：防保活动画/噪声导致连续解码
+// 是否本轮解码：新画面按最小间隔限速；同一画面解出过则跳过；失败过则限速重试
+function shouldDecodeFrame(sig, lastSig, lastSigOk, now, lastAttempt, retryMs, minInterval) {
+  if (sig !== lastSig) return now - lastAttempt >= (minInterval || 0);
   if (lastSigOk) return false;
   return now - lastAttempt >= retryMs;
 }
@@ -13152,13 +13162,17 @@ function listMissingChunks(asm, limit) {
   }
   return { total, first };
 }
-// 帧签名：把画面缩到 64×36 后采样哈希，用于「画面未变则跳过解码」
+// 帧签名：把画面中央 80% 缩到 64×36 后采样哈希，用于「画面未变则跳过解码」
+// 只取中央区域以忽略窗口边缘的保活动画（见发送端 #tx-beacon）
 function frameSignatureOf(source) {
   if (!frameSignatureOf.canvas) frameSignatureOf.canvas = document.createElement('canvas');
   const c = frameSignatureOf.canvas;
+  const w = source.videoWidth || source.width;
+  const h = source.videoHeight || source.height;
+  const mx = Math.round(w * 0.1), my = Math.round(h * 0.1);
   c.width = 64; c.height = 36;
   const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(source, 0, 0, 64, 36);
+  ctx.drawImage(source, mx, my, Math.max(1, w - mx * 2), Math.max(1, h - my * 2), 0, 0, 64, 36);
   const d = ctx.getImageData(0, 0, 64, 36).data;
   let h1 = 0, h2 = 0;
   for (let i = 0; i < d.length; i += 4) {
@@ -13212,6 +13226,12 @@ test('同帧解码失败应限速重试，成功后才跳过', () => {
   assertEq(shouldDecodeFrame('A', 'A', true, 10000, 0, R), false, '已成功解出的同帧不重试');
   assertEq(shouldDecodeFrame('B', 'A', true, 10, 0, R), true, '新画面即使上次成功也解码');
 });
+test('新画面解码限速：保活动画不应导致连续解码', () => {
+  assertEq(shouldDecodeFrame('B', 'A', true, 50, 0, 60, 80), false, '距上次尝试不足 80ms 应跳过');
+  assertEq(shouldDecodeFrame('B', 'A', true, 80, 0, 60, 80), true, '达到 80ms 应解码新画面');
+  assertEq(shouldDecodeFrame('A', 'A', false, 60, 0, 60, 80), true, '同帧失败重试仍按 60ms');
+  assertEq(shouldDecodeFrame('A', 'A', true, 10000, 0, 60, 80), false, '同帧成功仍跳过');
+});
 test('解码画布尺寸：长边按上限等比缩小，未超限保持原尺寸', () => {
   let s = fitDecodeSize(1920, 1080, 1600);
   assertEq(s.w, 1600); assertEq(s.h, 900);
@@ -13252,6 +13272,17 @@ test('帧签名：相同画面一致、不同画面不同', () => {
   const a1 = mk('#fff'), a2 = mk('#fff'), b = mk('#000');
   assertEq(frameSignatureOf(a1), frameSignatureOf(a2), '相同画面签名应一致');
   assert(frameSignatureOf(a1) !== frameSignatureOf(b), '不同画面签名应不同');
+});
+test('帧签名忽略边角保活动画，中央变化仍生效', () => {
+  const c = document.createElement('canvas');
+  c.width = 640; c.height = 360;
+  const x = c.getContext('2d');
+  x.fillStyle = '#fff'; x.fillRect(0, 0, 640, 360);
+  const before = frameSignatureOf(c);
+  x.fillStyle = '#000'; x.fillRect(0, 0, 6, 6);          // 左上角：10% 边距之外
+  assertEq(frameSignatureOf(c), before, '边角动画不应改变签名');
+  x.fillStyle = '#000'; x.fillRect(270, 130, 100, 100);   // 中央区域
+  assert(frameSignatureOf(c) !== before, '中央画面变化应改变签名');
 });
 test('同一次传输所有帧 QR 版本统一（尺寸一致）', async () => {
   const data = crypto.getRandomValues(new Uint8Array(1200));
