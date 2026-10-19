@@ -12487,6 +12487,10 @@ video { max-width: 320px; background: #000; }
     <div id="recv-stats" class="note"></div>
     <progress id="recv-progress" value="0" max="1" style="width:100%"></progress>
     <div id="chunk-grid"></div>
+    <div class="controls">
+      <button id="btn-copy-missing" disabled>复制缺失序号</button>
+      <input id="missing-text" readonly placeholder="缺失序号将显示在这里，可手动选中复制" style="flex:1; min-width:200px; font-size:12px">
+    </div>
     <div id="recv-result"></div>
   </section>
   <section id="view-test" style="display:none"></section>
@@ -13085,6 +13089,7 @@ const receiver = {
     document.getElementById('chunk-grid').innerHTML = '';
     document.getElementById('recv-result').innerHTML = '';
     document.getElementById('recv-progress').value = 0;
+    this.refreshMissing();
     setRecvStatus(this.stream ? '解码中：等待头帧…' : '等待抓屏');
   },
   scratch: null,
@@ -13187,8 +13192,37 @@ const receiver = {
       .then(r => this.onFrame(r))
       .catch(e => setRecvStatus('解码错误：' + e.message));
   },
+  // 刷新缺失序号文本框与按钮可用性；分片状态变化、reset 时调用
+  refreshMissing() {
+    const box = document.getElementById('missing-text');
+    const btn = document.getElementById('btn-copy-missing');
+    if (!box) return;
+    if (!this.asm.chunks && !this.asm.meta) {          // 未知总片数（A 帧整包除外，见下）
+      btn.disabled = true;
+      box.value = '（等待头帧或首个数据帧…）';
+      return;
+    }
+    if (!this.asm.chunks) {                            // A 帧整包：无分片概念
+      btn.disabled = true;
+      box.value = '（整包传输，无分片）';
+      return;
+    }
+    const seqs = missingSeqsOf(this.asm);
+    btn.disabled = false;
+    box.value = seqs.length ? '缺失 ' + seqs.length + ' 片：' + formatMissingSeqs(seqs) : '无缺失';
+  },
+  copyMissing() {
+    const seqs = missingSeqsOf(this.asm);
+    if (!seqs.length) return;
+    const text = formatMissingSeqs(seqs);
+    const done = () => setRecvStatus('已复制缺失序号（' + seqs.length + ' 片），请带到发送端「补充模式」粘贴');
+    const fail = () => setRecvStatus('复制失败：请手动选中文本框内容复制');
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fail);
+    else fail();
+  },
   onFrame(r) {
     const asm = this.asm;
+    this.refreshMissing();
     switch (r.kind) {
       case 'bad':
         rlog('坏帧（二维码可识别但帧格式错误）', { 累计坏帧: asm.badFrames, 已收: asm.received });
@@ -13262,19 +13296,16 @@ function shouldDecodeFrame(sig, lastSig, lastSigOk, now, lastAttempt, retryMs, m
   if (lastSigOk) return false;
   return now - lastAttempt >= retryMs;
 }
+// 全部缺失分片序号（升序）；A 帧路径 chunks 为 null 返回 []
+function missingSeqsOf(asm) {
+  const out = [];
+  if (asm.chunks) for (let i = 0; i < asm.chunks.length; i++) if (asm.chunks[i] === null) out.push(i);
+  return out;
+}
 // 缺失分片序号：total 为缺失总数，first 最多取 limit 个（日志用）
 function listMissingChunks(asm, limit) {
-  const first = [];
-  let total = 0;
-  if (asm.chunks) {
-    for (let i = 0; i < asm.chunks.length; i++) {
-      if (asm.chunks[i] === null) {
-        total++;
-        if (first.length < limit) first.push(i);
-      }
-    }
-  }
-  return { total, first };
+  const all = missingSeqsOf(asm);
+  return { total: all.length, first: all.slice(0, limit) };
 }
 // 帧签名：把画面中央 80% 缩到 64×36 后采样哈希，用于「画面未变则跳过解码」
 // 只取中央区域以忽略窗口边缘的保活动画（见发送端 #tx-beacon）
@@ -13319,6 +13350,7 @@ function downloadBlob(name, data) {
 function initReceiver() {
   document.getElementById('btn-capture').addEventListener('click', () => receiver.startCapture());
   document.getElementById('btn-recv-reset').addEventListener('click', () => receiver.reset());
+  document.getElementById('btn-copy-missing').addEventListener('click', () => receiver.copyMissing());
 }
 initReceiver();
 /* ===== 路由 ===== */
@@ -13717,6 +13749,35 @@ test('canRetry：多帧可补发，单帧整包与空 transfer 不可', async ()
 test('buildRetryPlaySeq：头帧领衔、seq 映射帧下标 +1、越界过滤', () => {
   assertEq(buildRetryPlaySeq([3, 7], 10).join(','), '0,4,8');
   assertEq(buildRetryPlaySeq([0, 10], 10).join(','), '0,1');   // 10 越界被过滤
+});
+test('missingSeqsOf 返回全部缺失序号，listMissingChunks 复用一致', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(1200));
+  const t = await prepareTransfer('miss.bin', data, 600);
+  const asm = new Assembler();
+  await asm.feed(t.frames[0]);
+  await asm.feed(t.frames[1]);   // seq 0
+  await asm.feed(t.frames[3]);   // seq 2
+  assertEq(missingSeqsOf(asm).join(','), '1');
+  const lm = listMissingChunks(asm, 50);
+  assertEq(lm.total, 1);
+  assertEq(lm.first.join(','), '1');
+});
+test('接收端缺失文本随分片进度刷新，收齐显示无缺失', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(800));
+  const t = await prepareTransfer('ui.bin', data, 600);
+  const origDownload = downloadBlob;
+  downloadBlob = () => {};
+  try {
+    receiver.asm = new Assembler(); receiver.done = false;
+    await receiver.asm.feed(t.frames[0]);
+    receiver.onFrame({ kind: 'header', meta: t.meta });
+    await receiver.asm.feed(t.frames[1]);
+    receiver.onFrame({ kind: 'progress', received: 1, total: t.meta.chunks, seq: 0, isNew: true });
+    const box = document.getElementById('missing-text');
+    assert(box.value.startsWith('缺失 1 片：#1;'), '实际：' + box.value);
+    receiver.onFrame(await receiver.asm.feed(t.frames[2]));
+    assertEq(box.value, '无缺失');
+  } finally { downloadBlob = origDownload; }
 });
 route();
 </script>
