@@ -13779,6 +13779,27 @@ test('接收端缺失文本随分片进度刷新，收齐显示无缺失', async
     assertEq(box.value, '无缺失');
   } finally { downloadBlob = origDownload; }
 });
+test('补充模式全链路：缺失导出→解析→仅重播补发帧→收齐且数据一致', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(3000));
+  const t = await prepareTransfer('retry-e2e.bin', data, 600);   // 5 片，frames = H + D0..D4
+  const asm = new Assembler();
+  await asm.feed(t.frames[0]);
+  const missSet = new Set([1, 3, 4]);                             // 模拟漏 3 片
+  for (let i = 1; i < t.frames.length; i++) {
+    if (missSet.has(i - 1)) continue;
+    await asm.feed(t.frames[i]);
+  }
+  assertEq(asm.received, t.meta.chunks - 3);
+  const seqs = missingSeqsOf(asm);
+  assertEq(seqs.join(','), '1,3,4');
+  const parsed = parseRetryList(formatMissingSeqs(seqs), t.meta.chunks);
+  assertEq(parsed.checksumOk, true);
+  assertEq(buildRetryPlaySeq(parsed.seqs, t.meta.chunks).join(','), '0,2,4,5');
+  let last;
+  for (const fi of [0, 2, 4, 5]) last = await asm.feed(t.frames[fi]);   // 补发即重播原始帧字节
+  assertEq(last.kind, 'complete');
+  assertBytesEq(last.data, data);
+});
 route();
 </script>
 </body>
