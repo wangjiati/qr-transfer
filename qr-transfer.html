@@ -12707,6 +12707,51 @@ class Assembler {
     return { kind: 'complete', meta, data };
   }
 }
+
+/* ===== 补充模式：缺失序号文本 ===== */
+// 位置加权校验：h = (h*31 + seq) & 0xFFFF，能拦截等和替换（3,7 → 4,6）与漏打/多打
+function retryChecksum(seqs) {
+  let h = 0;
+  for (const s of seqs) h = (h * 31 + s) & 0xffff;
+  return h.toString(16).toUpperCase().padStart(4, '0');
+}
+// 升序序号 → '#3-5,7;C9F27'；输入自行排序去重，空集返回 ''
+function formatMissingSeqs(seqs) {
+  const sorted = [...new Set(seqs)].sort((a, b) => a - b);
+  if (!sorted.length) return '';
+  const parts = [];
+  let start = sorted[0], prev = sorted[0];
+  for (let i = 1; i <= sorted.length; i++) {
+    const s = sorted[i];
+    if (s !== prev + 1) {                       // 区间断开（含末尾 s === undefined）
+      parts.push(start === prev ? String(start) : start + '-' + prev);
+      start = s;
+    }
+    prev = s;
+  }
+  return '#' + parts.join(',') + ';C' + retryChecksum(sorted);
+}
+// 文本 → { seqs(去重升序，含越界), ignored, checksumOk: true|false|'absent', outOfRange }
+// 校验对象 = 全部解析出的序号（含越界）：生成端不产越界，故「相符」基本排除错打
+function parseRetryList(text, chunks) {
+  const out = { seqs: [], ignored: 0, checksumOk: 'absent', outOfRange: 0 };
+  let s = String(text == null ? '' : text).trim();
+  if (s.startsWith('#')) s = s.slice(1).trim();
+  const m = s.match(/[;；][Cc]([0-9a-fA-F]{4})$/);   // 仅文本末尾识别校验段
+  if (m) { s = s.slice(0, m.index).trim(); }
+  for (const seg of s.split(/[,，;；\s]+/)) {
+    if (!seg) continue;
+    const r = seg.match(/^(\d+)\s*(?:[-~]\s*(\d+))?$/);
+    if (!r) { out.ignored++; continue; }
+    let a = +r[1], b = r[2] === undefined ? a : +r[2];
+    if (a > b) { const t2 = a; a = b; b = t2; }       // 区间写反自动交换
+    for (let i = a; i <= b; i++) out.seqs.push(i);
+  }
+  out.seqs = [...new Set(out.seqs)].sort((a, b) => a - b);
+  for (const q of out.seqs) if (q >= chunks) out.outOfRange++;
+  if (m) out.checksumOk = retryChecksum(out.seqs) === m[1].toUpperCase();
+  return out;
+}
 /* ===== QR 图像层 ===== */
 // __QRIMAGE__
 // 二进制 → latin1 字符串（qrcode-generator 的 Byte 模式按 charCodeAt & 0xff 处理）
@@ -13566,6 +13611,37 @@ test('切片与拼接', () => {
 test('库已加载', () => {
   assert(typeof qrcode === 'function', 'qrcode-generator 未加载');
   assert(typeof jsQR === 'function', 'jsQR 未加载');
+});
+test('formatMissingSeqs：连续合并区间、单片直书、空集返回空串', () => {
+  assertEq(formatMissingSeqs([3, 4, 5, 7]), '#3-5,7;C' + retryChecksum([3, 4, 5, 7]));
+  assertEq(formatMissingSeqs([9]), '#9;C' + retryChecksum([9]));
+  assertEq(formatMissingSeqs([]), '');
+});
+test('parseRetryList：分隔符/区间符号/#前缀宽容，格式化-解析往返一致', () => {
+  const seqs = [3, 4, 5, 7, 15, 16];
+  const r = parseRetryList(formatMissingSeqs(seqs), 100);
+  assertEq(r.seqs.join(','), seqs.join(','));
+  assertEq(r.checksumOk, true);
+  assertEq(r.ignored, 0);
+  const r2 = parseRetryList('#3~5，7 15-16；c' + retryChecksum(seqs), 100);
+  assertEq(r2.seqs.join(','), seqs.join(','));
+  assertEq(r2.checksumOk, true);
+});
+test('parseRetryList：篡改序号被校验拦截；无校验段放行且标记 absent', () => {
+  const cs = retryChecksum([3, 7]);
+  assertEq(parseRetryList('#4,7;C' + cs, 100).checksumOk, false);
+  const noCs = parseRetryList('3,7', 100);
+  assertEq(noCs.checksumOk, 'absent');
+  assertEq(noCs.seqs.join(','), '3,7');
+});
+test('parseRetryList：区间写反交换、坏段忽略计数、越界计数、空输入空集', () => {
+  let r = parseRetryList('#7-3,x,99', 10);
+  assertEq(r.seqs.join(','), '3,4,5,6,7,99');
+  assertEq(r.ignored, 1);
+  assertEq(r.outOfRange, 1);
+  r = parseRetryList('', 10);
+  assertEq(r.seqs.length, 0);
+  assertEq(r.ignored, 0);
 });
 route();
 </script>
