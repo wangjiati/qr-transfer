@@ -12752,6 +12752,16 @@ function parseRetryList(text, chunks) {
   if (m) out.checksumOk = retryChecksum(out.seqs) === m[1].toUpperCase();
   return out;
 }
+// 补发播放序列：[头帧, …seq+1…]；输入约定为 parseRetryList 输出的去重升序 seqs
+function buildRetryPlaySeq(seqs, chunks) {
+  const play = [0];
+  for (const s of seqs) if (s < chunks) play.push(s + 1);
+  return play;
+}
+// 仅多帧传输（H + 数据帧）可补发；A 帧单帧无补发意义
+function canRetry(transfer) {
+  return !!(transfer && transfer.frames && transfer.frames.length > 1);
+}
 /* ===== QR 图像层 ===== */
 // __QRIMAGE__
 // 二进制 → latin1 字符串（qrcode-generator 的 Byte 模式按 charCodeAt & 0xff 处理）
@@ -12816,6 +12826,8 @@ function slog(...args) {
 }
 const sender = {
   transfer: null,      // { meta, tid, frames }
+  mode: 'full',        // 'full' | 'retry'
+  playSeq: null,       // 播放帧下标序列；null = 全量 [0..n)
   qrVersion: 0,        // 统一 QR 版本（由 pickQrVersion 探测）
   timer: null,
   idx: 0,
@@ -12846,6 +12858,7 @@ const sender = {
     // 窗口期内可能已被点击启动定时器，再次 pause 清除（成功路径末尾会重新启用按钮）
     this.pause();
     this.qrVersion = pickQrVersion(this.transfer.frames);
+    this.mode = 'full'; this.playSeq = null;
     this.idx = 0; this.loops = 0;
     prep.value = 100; prep.style.display = 'none';
     const m = this.transfer.meta;
@@ -12863,11 +12876,12 @@ const sender = {
   start() {
     if (!this.transfer || this.timer) return;
     const fps = +document.getElementById('opt-fps').value;
-    const n = this.transfer.frames.length;
+    const seq = this.playSeq;                              // null = 全量
+    const n = seq ? seq.length : this.transfer.frames.length;
     const canvas = document.getElementById('qr-canvas');
     this.loopStart = performance.now(); this.renderMs = 0; this.rendered = 0;
     slog('开始', {
-      fps, 帧间隔ms: Math.round(1000 / fps), 帧数: n, 分片: this.transfer.meta.chunks,
+      模式: this.mode, fps, 帧间隔ms: Math.round(1000 / fps), 帧数: n, 分片: this.transfer.meta.chunks,
       QR版本: this.qrVersion, 画布: canvas.width + '×' + canvas.height,
       屏幕: window.screen.width + '×' + window.screen.height,
       窗口: window.innerWidth + '×' + window.innerHeight,
@@ -12876,7 +12890,8 @@ const sender = {
     this.timer = setInterval(() => {
       const t0 = performance.now();
       // 按需构建当前帧：不预建全量模型（大文件几千帧会冻结 UI 并耗费数 GB 内存）
-      drawQrModel(buildQrModel(this.transfer.frames[this.idx], this.qrVersion), canvas, qrMaxPx());
+      const fi = seq ? seq[this.idx] : this.idx;
+      drawQrModel(buildQrModel(this.transfer.frames[fi], this.qrVersion), canvas, qrMaxPx());
       this.renderMs += performance.now() - t0;
       this.rendered++;
       this.idx++;
@@ -12901,6 +12916,28 @@ const sender = {
     document.getElementById('btn-send-pause').disabled = true;
     if (this.transfer) document.getElementById('btn-send-start').disabled = false;
   },
+  // 补发入口：解析文本 → 校验 → 仅循环 [头帧, …缺失帧]；返回 { ok, msg } 供 UI 显示
+  startRetry(text) {
+    if (!canRetry(this.transfer)) return { ok: false, msg: '当前无多帧传输（整包单帧无需补发）' };
+    const r = parseRetryList(text, this.transfer.meta.chunks);
+    if (!r.seqs.length) return { ok: false, msg: '未解析到任何有效序号' + (r.ignored ? '（忽略 ' + r.ignored + ' 个无效段）' : '') };
+    if (r.checksumOk === false) return { ok: false, msg: '校验不符，请核对文本（尤其手打场景）' };
+    this.pause();
+    this.mode = 'retry';
+    this.playSeq = buildRetryPlaySeq(r.seqs, this.transfer.meta.chunks);
+    this.idx = 0; this.loops = 0;
+    this.start();
+    const extra = (r.outOfRange ? '，忽略越界 ' + r.outOfRange + ' 个' : '') + (r.checksumOk === 'absent' ? '，无校验码' : '');
+    return { ok: true, msg: this.playSeq.length - 1 + ' 片' + extra };
+  },
+  // 任意状态回到全量播放
+  startFull() {
+    if (!this.transfer) return;
+    this.pause();
+    this.mode = 'full'; this.playSeq = null;
+    this.idx = 0; this.loops = 0;
+    this.start();
+  },
 };
 function nextFrame() { return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); }
 function qrMaxPx() {
@@ -12911,8 +12948,12 @@ function qrMaxPx() {
 }
 function setSendStatus(s) { document.getElementById('send-status').textContent = s; }
 function updateSendProgress() {
-  const n = sender.transfer.frames.length;
+  const n = sender.playSeq ? sender.playSeq.length : sender.transfer.frames.length;
   const fps = +document.getElementById('opt-fps').value;
+  if (sender.mode === 'retry') {
+    setSendStatus('补发中：' + (n - 1) + ' 片｜' + fps + ' fps｜已循环 ' + sender.loops + ' 圈｜每圈约 ' + (n / fps).toFixed(1) + ' s');
+    return;
+  }
   const label = n === 1 ? '静态帧' : (sender.idx === 0 ? '头帧' : '数据帧 ' + sender.idx + '/' + (n - 1));
   setSendStatus(
     '播放中：' + label + '｜' + fps + ' fps｜已循环 ' + sender.loops + ' 圈｜每圈约 ' + (n / fps).toFixed(1) + ' s'
@@ -13642,6 +13683,17 @@ test('parseRetryList：区间写反交换、坏段忽略计数、越界计数、
   r = parseRetryList('', 10);
   assertEq(r.seqs.length, 0);
   assertEq(r.ignored, 0);
+});
+test('canRetry：多帧可补发，单帧整包与空 transfer 不可', async () => {
+  const big = await prepareTransfer('big.bin', crypto.getRandomValues(new Uint8Array(1200)), 600);
+  assertEq(canRetry(big), true);
+  const small = await prepareTransfer('small.bin', new Uint8Array(10), 600);
+  assertEq(canRetry(small), false);
+  assertEq(canRetry(null), false);
+});
+test('buildRetryPlaySeq：头帧领衔、seq 映射帧下标 +1、越界过滤', () => {
+  assertEq(buildRetryPlaySeq([3, 7], 10).join(','), '0,4,8');
+  assertEq(buildRetryPlaySeq([0, 10], 10).join(','), '0,1');   // 10 越界被过滤
 });
 route();
 </script>
