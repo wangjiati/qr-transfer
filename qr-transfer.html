@@ -12994,7 +12994,8 @@ function initSender() {
   document.getElementById('opt-size').addEventListener('change', () => {
     // 暂停中换尺寸：立即重绘当前帧；播放中下一帧自动生效
     if (!sender.timer && sender.transfer) {
-      drawQrModel(buildQrModel(sender.transfer.frames[sender.idx], sender.qrVersion), document.getElementById('qr-canvas'), qrMaxPx());
+      const fi = sender.playSeq ? sender.playSeq[sender.idx] : sender.idx;   // 补发模式下 idx 是播放序列内位置，需映射回原始帧下标
+      drawQrModel(buildQrModel(sender.transfer.frames[fi], sender.qrVersion), document.getElementById('qr-canvas'), qrMaxPx());
     }
   });
   document.getElementById('btn-retry-start').addEventListener('click', () => {
@@ -13197,14 +13198,14 @@ const receiver = {
     const box = document.getElementById('missing-text');
     const btn = document.getElementById('btn-copy-missing');
     if (!box) return;
-    if (!this.asm.chunks && !this.asm.meta) {          // 未知总片数（A 帧整包除外，见下）
-      btn.disabled = true;
-      box.value = '（等待头帧或首个数据帧…）';
-      return;
-    }
-    if (!this.asm.chunks) {                            // A 帧整包：无分片概念
+    if (!this.asm.chunks && (this.asm.meta || this.asm.doneFlag)) {   // A 帧整包（完成或进行中无分片概念；ALL 路径不置 meta/chunks，成功仅置 doneFlag）
       btn.disabled = true;
       box.value = '（整包传输，无分片）';
+      return;
+    }
+    if (!this.asm.chunks) {                            // 未知总片数
+      btn.disabled = true;
+      box.value = '（等待头帧或首个数据帧…）';
       return;
     }
     const seqs = missingSeqsOf(this.asm);
@@ -13751,7 +13752,7 @@ test('buildRetryPlaySeq：头帧领衔、seq 映射帧下标 +1、越界过滤',
   assertEq(buildRetryPlaySeq([0, 10], 10).join(','), '0,1');   // 10 越界被过滤
 });
 test('missingSeqsOf 返回全部缺失序号，listMissingChunks 复用一致', async () => {
-  const data = crypto.getRandomValues(new Uint8Array(1200));
+  const data = crypto.getRandomValues(new Uint8Array(1800));
   const t = await prepareTransfer('miss.bin', data, 600);
   const asm = new Assembler();
   await asm.feed(t.frames[0]);
@@ -13799,6 +13800,26 @@ test('补充模式全链路：缺失导出→解析→仅重播补发帧→收�
   for (const fi of [0, 2, 4, 5]) last = await asm.feed(t.frames[fi]);   // 补发即重播原始帧字节
   assertEq(last.kind, 'complete');
   assertBytesEq(last.data, data);
+});
+test('A 帧整包完成后缺失文本显示整包传输', async () => {
+  const data = crypto.getRandomValues(new Uint8Array(200));
+  const t = await prepareTransfer('all.bin', data, 600);
+  assertEq(t.frames.length, 1, '应为单帧整包');
+  const origDownload = downloadBlob;
+  downloadBlob = () => {};
+  try {
+    receiver.asm = new Assembler(); receiver.done = false;
+    receiver.onFrame(await receiver.asm.feed(t.frames[0]));
+    const box = document.getElementById('missing-text');
+    assert(box.value.indexOf('整包传输') >= 0, '实际：' + box.value);
+  } finally { downloadBlob = origDownload; }
+});
+test('parseRetryList：校验对象含越界序号——按全量序号计算而非过滤后', () => {
+  const r = parseRetryList('#1,3;C' + retryChecksum([1, 3]), 2);   // 3 越界，校验按含越界的 [1,3] 计算
+  assertEq(r.outOfRange, 1);
+  assertEq(r.checksumOk, true, '越界序号应参与校验计算');
+  const r2 = parseRetryList('#1,3;C' + retryChecksum([1]), 2);     // 若实现错误地按过滤后 [1] 计算，此处会误判通过
+  assertEq(r2.checksumOk, false);
 });
 route();
 </script>
