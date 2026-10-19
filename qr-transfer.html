@@ -12469,6 +12469,12 @@ video { max-width: 320px; background: #000; }
     </div>
     <progress id="send-prep" max="100" value="0" style="display:none"></progress>
     <canvas id="qr-canvas"></canvas>
+    <div class="controls" id="retry-box" style="display:none">
+      <button id="btn-retry-start" disabled>仅补发这些帧</button>
+      <button id="btn-retry-full" disabled>恢复全量播放</button>
+      <input id="retry-input" placeholder="粘贴缺失序号，如 #3-7,15;C9F27（支持手打，区间 3-7 或 3~7）" style="flex:1; min-width:260px; font-size:12px">
+    </div>
+    <div id="retry-status" class="note" style="display:none"></div>
     <div id="send-status" class="status">未选择文件</div>
   </section>
   <section id="view-receive" style="display:none">
@@ -12861,6 +12867,12 @@ const sender = {
     this.mode = 'full'; this.playSeq = null;
     this.idx = 0; this.loops = 0;
     prep.value = 100; prep.style.display = 'none';
+    const retryOk = canRetry(this.transfer);
+    document.getElementById('retry-box').style.display = retryOk ? '' : 'none';
+    document.getElementById('btn-retry-start').disabled = !retryOk;
+    document.getElementById('btn-retry-full').disabled = !retryOk;
+    document.getElementById('retry-input').value = '';
+    document.getElementById('retry-status').style.display = 'none';
     const m = this.transfer.meta;
     setSendStatus(
       '文件：' + m.name + '（' + m.size + ' B' +
@@ -12980,6 +12992,17 @@ function initSender() {
     if (!sender.timer && sender.transfer) {
       drawQrModel(buildQrModel(sender.transfer.frames[sender.idx], sender.qrVersion), document.getElementById('qr-canvas'), qrMaxPx());
     }
+  });
+  document.getElementById('btn-retry-start').addEventListener('click', () => {
+    const r = sender.startRetry(document.getElementById('retry-input').value);
+    const st = document.getElementById('retry-status');
+    st.style.display = '';
+    st.textContent = r.ok ? '补发已启动：' + r.msg : '未启动：' + r.msg;
+  });
+  document.getElementById('btn-retry-full').addEventListener('click', () => {
+    sender.startFull();
+    const st = document.getElementById('retry-status');
+    st.style.display = ''; st.textContent = '已恢复全量播放';
   });
 }
 initSender();
